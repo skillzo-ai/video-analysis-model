@@ -12,6 +12,7 @@ dependencies = [
     "torch",
     "torchvision",
     "supervision>=0.20.0",
+    "numpy>=2.4.4",
 ]
 
 [tool.uv.sources]
