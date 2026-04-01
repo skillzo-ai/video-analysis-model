@@ -4,6 +4,8 @@ import numpy as np
 from .detector import Detector
 from .visualize import Visualizer
 from .reid import PlayerReID, cosine_similarity
+from .ball_kalman import BallKalmanTracker
+from .possession import PossessionAssigner
 
 class VideoProcessor:
     def __init__(self, player_model_path: str, ball_model_path: str, output_path: str = "output_tracked.mp4"):
@@ -22,6 +24,91 @@ class VideoProcessor:
         self.id_map = {}    # current_tracker_id -> original_id (for Re-ID remapping)
         self.next_reid_id = 1
         self.similarity_threshold = 0.85 # Threshold for visual match
+        self.ball_tracker = BallKalmanTracker(process_var=25.0, meas_var=80.0)
+        self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
+        self._last_possessor_id = None
+
+    @staticmethod
+    def _append_synthetic_detection(base: sv.Detections, extra: sv.Detections) -> sv.Detections:
+        """
+        supervision.Detections.merge() requires matching data keys; this append pads base.data keys.
+        Assumes `extra` contains exactly one row.
+        """
+        if base is None or len(base) == 0:
+            return extra
+
+        # Core fields
+        xyxy = np.concatenate([base.xyxy, extra.xyxy], axis=0)
+
+        confidence = None
+        if base.confidence is not None or extra.confidence is not None:
+            b = base.confidence if base.confidence is not None else np.zeros((len(base),), dtype=np.float32)
+            e = extra.confidence if extra.confidence is not None else np.zeros((len(extra),), dtype=b.dtype)
+            confidence = np.concatenate([b, e], axis=0)
+
+        class_id = None
+        if base.class_id is not None or extra.class_id is not None:
+            b = base.class_id if base.class_id is not None else np.zeros((len(base),), dtype=np.int32)
+            e = extra.class_id if extra.class_id is not None else np.zeros((len(extra),), dtype=b.dtype)
+            class_id = np.concatenate([b, e], axis=0)
+
+        tracker_id = None
+        if base.tracker_id is not None or extra.tracker_id is not None:
+            b = base.tracker_id if base.tracker_id is not None else np.full((len(base),), -1, dtype=np.int32)
+            e = extra.tracker_id if extra.tracker_id is not None else np.full((len(extra),), -1, dtype=b.dtype)
+            tracker_id = np.concatenate([b, e], axis=0)
+
+        # Optional masks
+        mask = None
+        if getattr(base, "mask", None) is not None or getattr(extra, "mask", None) is not None:
+            b = base.mask if getattr(base, "mask", None) is not None else None
+            e = extra.mask if getattr(extra, "mask", None) is not None else None
+            if b is not None and e is not None:
+                mask = np.concatenate([b, e], axis=0)
+            elif b is not None:
+                # pad one empty mask if needed (best-effort)
+                mask = b
+            else:
+                mask = e
+
+        # Pad data keys
+        base_data = dict(getattr(base, "data", {}) or {})
+        extra_data = dict(getattr(extra, "data", {}) or {})
+        out_data = {}
+        all_keys = set(base_data.keys()) | set(extra_data.keys())
+        for k in all_keys:
+            bv = base_data.get(k, None)
+            ev = extra_data.get(k, None)
+
+            if isinstance(bv, np.ndarray):
+                if ev is None:
+                    pad = np.zeros((1, *bv.shape[1:]), dtype=bv.dtype)
+                    out_data[k] = np.concatenate([bv, pad], axis=0)
+                else:
+                    out_data[k] = np.concatenate([bv, np.asarray(ev)], axis=0)
+            elif isinstance(bv, (list, tuple)):
+                if ev is None:
+                    out_data[k] = list(bv) + [None]
+                elif isinstance(ev, (list, tuple)):
+                    out_data[k] = list(bv) + list(ev)
+                else:
+                    out_data[k] = list(bv) + [ev]
+            else:
+                # Unknown / missing in base: create placeholder list for base rows
+                base_pad = [None] * len(base)
+                if isinstance(ev, (list, tuple)):
+                    out_data[k] = base_pad + list(ev)
+                else:
+                    out_data[k] = base_pad + [ev]
+
+        return sv.Detections(
+            xyxy=xyxy,
+            mask=mask,
+            confidence=confidence,
+            class_id=class_id,
+            tracker_id=tracker_id,
+            data=out_data,
+        )
 
     def process_video(self, source: str):
         """
@@ -129,7 +216,65 @@ class VideoProcessor:
 
                 # Update detections with re-mapped IDs
                 detections.tracker_id = np.array(new_tracker_ids)
+
+                # 3.5 Ball Kalman tracking (ensure ball exists every frame)
+                ball_mask = detections.class_id == 0
+                ball_center_xy = None
+
+                if np.any(ball_mask):
+                    ball_idx = int(np.where(ball_mask)[0][0])
+                    b = detections.xyxy[ball_idx].astype(np.float32)
+                    bc = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
+                    self.ball_tracker.last_size_wh = (float(b[2] - b[0]), float(b[3] - b[1]))
+                    ball_center_xy = self.ball_tracker.update(bc)
+
+                    # Force stable ball id for downstream logic/visuals
+                    try:
+                        detections.tracker_id[ball_idx] = 0
+                    except Exception:
+                        pass
+                else:
+                    # No detection: predict ball location and inject a synthetic ball detection
+                    if not self.ball_tracker.initialized:
+                        # Must have a ball every frame: initialize at frame center until first real detection arrives.
+                        h, w = frame.shape[:2]
+                        ball_center_xy = self.ball_tracker.update((w * 0.5, h * 0.5))
+                        bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
+                        synth = sv.Detections(
+                            xyxy=np.array([bb], dtype=np.float32),
+                            confidence=np.array([0.01], dtype=np.float32),
+                            class_id=np.array([0], dtype=np.int32),
+                            tracker_id=np.array([0], dtype=np.int32),
+                        )
+                        detections = self._append_synthetic_detection(detections, synth)
+                    else:
+                        ball_center_xy = self.ball_tracker.predict(dt=1.0)
+                        if ball_center_xy[0] is not None:
+                            bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
+                            synth = sv.Detections(
+                                xyxy=np.array([bb], dtype=np.float32),
+                                confidence=np.array([0.01], dtype=np.float32),
+                                class_id=np.array([0], dtype=np.int32),
+                                tracker_id=np.array([0], dtype=np.int32),
+                            )
+                            detections = self._append_synthetic_detection(detections, synth)
                 
+                # 3.6 Possession assignment (nearest player to ball)
+                player_mask = detections.class_id == 4
+                possessor_id = None
+                if ball_center_xy is not None and np.any(player_mask):
+                    possessor_id = self.possession.update(
+                        ball_center_xy=ball_center_xy,
+                        player_xyxy=detections.xyxy[player_mask],
+                        player_ids=detections.tracker_id[player_mask],
+                    )
+                else:
+                    possessor_id = self.possession.update(
+                        ball_center_xy=None,
+                        player_xyxy=None,
+                        player_ids=None,
+                    )
+
                 # 4. Label preparation
                 labels = []
                 for class_id, tracker_id in zip(detections.class_id, detections.tracker_id):
@@ -141,6 +286,27 @@ class VideoProcessor:
                     frame=frame, 
                     detections=detections, 
                     labels=labels
+                )
+
+                # Top overlay: who has the ball
+                if possessor_id is not None:
+                    text = f"Player {int(possessor_id)} has ball"
+                else:
+                    text = "No possession"
+
+                if possessor_id != self._last_possessor_id and possessor_id is not None:
+                    print(f"Player {int(possessor_id)} has ball")
+                self._last_possessor_id = possessor_id
+
+                cv2.putText(
+                    annotated_frame,
+                    text,
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
                 )
                 
                 # 6. Write frame
