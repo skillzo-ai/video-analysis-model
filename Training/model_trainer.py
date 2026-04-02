@@ -1,6 +1,7 @@
 import torch
 from ultralytics import YOLO
 import traceback
+import os
 
 
 def get_device():
@@ -22,10 +23,11 @@ def main():
 
     try:
         model = YOLO("yolov8n.pt")
-
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        data_dir = os.path.join(repo_root, "data")
         results = model.train(
             data="data/data.yaml",
-            epochs=80,
+            epochs=120,
             imgsz=832,
             batch=16,
             device=device,
@@ -33,9 +35,23 @@ def main():
             lr0=0.001,
             cos_lr=True,
             workers=4,
-            project="runs",
+            project=os.path.join(data_dir, "runs"),
             name="basketball_model",
-            exist_ok=True,  # 🔥 prevents crash if folder exists
+            exist_ok=True,
+
+            # 🔥 ADD THESE (HSV augmentation)
+            hsv_h=0.015,
+            hsv_s=0.5,
+            hsv_v=0.3,
+
+            # 🔥 HIGHLY RECOMMENDED for your use case
+            mosaic=1.0,
+            mixup=0.1,
+
+            # Optional but useful
+            degrees=10,
+            translate=0.1,
+            scale=0.5
         )
 
         print("\n✅ Training Completed Successfully!")
@@ -49,7 +65,7 @@ def main():
         traceback.print_exc()
 
     finally:
-        print("\n📦 Check 'runs/' folder for saved weights (best.pt / last.pt)\n")
+        print("\n📦 Check 'data/runs/' folder for saved weights (best.pt / last.pt)\n")
 
 
 if __name__ == "__main__":

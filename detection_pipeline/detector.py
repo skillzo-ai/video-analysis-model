@@ -1,39 +1,42 @@
-import cv2
 import numpy as np
 from ultralytics import YOLO
 import supervision as sv
 
 class Detector:
-    def __init__(self, player_model_path: str = "best.pt", ball_model_path: str = "ball_detector_model.pt"):
+    def __init__(self, model_path: str = "best.pt"):
         """
-        Initialize with two models:
-        - player_model: Primarily for Players (4) and Hoops (2).
-        - ball_model: Dedicated for Balls (typically class 0).
+        Single-model detector for all classes (Ball=0, Hoop=2, Player=4).
         """
-        self.player_model = YOLO(player_model_path)
-        self.ball_model = YOLO(ball_model_path)
+        self.model = YOLO(model_path)
         
+        self.keep_classes = [0, 2, 4]
         self.player_hoop_classes = [2, 4]
-        # Assuming ball_model's class 0 is the ball. 
-        # If it's a dedicated model, we might take all its detections.
-        self.ball_class = [0] 
+        self.ball_class = [0]
 
-    def get_detections(self, frame: np.ndarray, conf: float = 0.3):
+    def get_detections(
+        self,
+        frame: np.ndarray,
+        conf: float = 0.15,
+        iou: float = 0.5,
+        player_conf: float = 0.3,
+    ):
         """
-        Combine detections from both models.
+        Run one model, keep Ball/Hoop/Player, and apply a higher conf threshold to players/hoops.
         """
-        # 1. Get Players and Hoops
-        player_results = self.player_model(frame, conf=conf, imgsz=832, verbose=False)[0]
-        player_detections = sv.Detections.from_ultralytics(player_results)
-        player_mask = np.isin(player_detections.class_id, self.player_hoop_classes)
-        player_detections = player_detections[player_mask]
+        results = self.model(frame, conf=conf, iou=iou, imgsz=832, verbose=False, classes=self.keep_classes)[0]
+        det = sv.Detections.from_ultralytics(results)
 
-        # 2. Get Ball(s)
-        ball_results = self.ball_model(frame, conf=conf, imgsz=832, verbose=False)[0]
-        ball_detections = sv.Detections.from_ultralytics(ball_results)
-        ball_mask = np.isin(ball_detections.class_id, self.ball_class)
-        ball_detections = ball_detections[ball_mask]
+        if len(det) == 0:
+            return det
 
-        # 3. Merge
-        combined_detections = sv.Detections.merge([player_detections, ball_detections])
-        return combined_detections
+        # Keep only desired classes
+        keep_mask = np.isin(det.class_id, self.keep_classes)
+        det = det[keep_mask]
+
+        # Apply higher conf threshold to players/hoops (ball keeps lower threshold)
+        if det.confidence is not None:
+            is_player_or_hoop = np.isin(det.class_id, self.player_hoop_classes)
+            hi_ok = (~is_player_or_hoop) | (det.confidence >= float(player_conf))
+            det = det[hi_ok]
+
+        return det

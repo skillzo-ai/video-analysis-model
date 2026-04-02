@@ -7,9 +7,13 @@ from .reid import PlayerReID, cosine_similarity
 from .ball_kalman import BallKalmanTracker
 from .possession import PossessionAssigner
 
+from team_clustering.config import TeamClusteringConfig
+from team_clustering.pipeline import classify_teams_no_draw
+from team_clustering.visualization import draw_player_ellipse
+
 class VideoProcessor:
-    def __init__(self, player_model_path: str, ball_model_path: str, output_path: str = "output_tracked.mp4"):
-        self.detector = Detector(player_model_path, ball_model_path)
+    def __init__(self, model_path: str, output_path: str = "output_tracked.mp4"):
+        self.detector = Detector(model_path)
         self.visualizer = Visualizer()
         self.output_path = output_path
         self.tracker = sv.ByteTrack(
@@ -27,6 +31,10 @@ class VideoProcessor:
         self.ball_tracker = BallKalmanTracker(process_var=25.0, meas_var=80.0)
         self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
         self._last_possessor_id = None
+
+        # Team clustering state (tracker_id -> vote counts)
+        self.team_cfg = TeamClusteringConfig(debug=False, draw_text=False)
+        self._team_votes = {}  # tid -> np.array([votes_teamA, votes_teamB], float32)
 
     @staticmethod
     def _append_synthetic_detection(base: sv.Detections, extra: sv.Detections) -> sv.Detections:
@@ -110,6 +118,22 @@ class VideoProcessor:
             data=out_data,
         )
 
+    @staticmethod
+    def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
+        a = a.astype(np.float32).reshape(4)
+        b = b.astype(np.float32).reshape(4)
+        x1 = max(a[0], b[0])
+        y1 = max(a[1], b[1])
+        x2 = min(a[2], b[2])
+        y2 = min(a[3], b[3])
+        iw = max(0.0, x2 - x1)
+        ih = max(0.0, y2 - y1)
+        inter = iw * ih
+        area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+        area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+        union = area_a + area_b - inter
+        return float(inter / union) if union > 0 else 0.0
+
     def process_video(self, source: str):
         """
         Process the video frame-by-frame with tracking and visual Re-ID.
@@ -118,7 +142,9 @@ class VideoProcessor:
         frame_generator = sv.get_video_frames_generator(source)
         
         with sv.VideoSink(self.output_path, video_info) as sink:
+            frame_idx = 0
             for frame in frame_generator:
+                frame_idx += 1
                 # 1. Detection
                 detections = self.detector.get_detections(frame)
                 
@@ -220,13 +246,22 @@ class VideoProcessor:
                 # 3.5 Ball Kalman tracking (ensure ball exists every frame)
                 ball_mask = detections.class_id == 0
                 ball_center_xy = None
+                ball_source = "none"
 
                 if np.any(ball_mask):
                     ball_idx = int(np.where(ball_mask)[0][0])
                     b = detections.xyxy[ball_idx].astype(np.float32)
                     bc = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
                     self.ball_tracker.last_size_wh = (float(b[2] - b[0]), float(b[3] - b[1]))
+
+                    # Accept detection; tracker's filtered center is what we draw/use.
                     ball_center_xy = self.ball_tracker.update(bc)
+                    self.ball_tracker.note_measurement(bc)
+                    ball_source = "det"
+
+                    # Force displayed bbox to follow tracker output (prevents "stuck box")
+                    tracked_bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
+                    detections.xyxy[ball_idx] = tracked_bb
 
                     # Force stable ball id for downstream logic/visuals
                     try:
@@ -234,11 +269,12 @@ class VideoProcessor:
                     except Exception:
                         pass
                 else:
-                    # No detection: predict ball location and inject a synthetic ball detection
+                    # No detection: predicted = current_pos + (current_pos - prev_pos)
                     if not self.ball_tracker.initialized:
                         # Must have a ball every frame: initialize at frame center until first real detection arrives.
                         h, w = frame.shape[:2]
                         ball_center_xy = self.ball_tracker.update((w * 0.5, h * 0.5))
+                        ball_source = "init_center"
                         bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
                         synth = sv.Detections(
                             xyxy=np.array([bb], dtype=np.float32),
@@ -248,8 +284,16 @@ class VideoProcessor:
                         )
                         detections = self._append_synthetic_detection(detections, synth)
                     else:
-                        ball_center_xy = self.ball_tracker.predict(dt=1.0)
-                        if ball_center_xy[0] is not None:
+                        vel_pred_center = self.ball_tracker.velocity_predict_center()
+                        if vel_pred_center is None:
+                            # fallback to Kalman predict if we don't have two centers yet
+                            ball_center_xy = self.ball_tracker.predict(dt=1.0)
+                            ball_source = "kalman_pred"
+                        else:
+                            ball_center_xy = self.ball_tracker.update(vel_pred_center)
+                            ball_source = "vel_pred"
+
+                        if ball_center_xy is not None and ball_center_xy[0] is not None:
                             bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
                             synth = sv.Detections(
                                 xyxy=np.array([bb], dtype=np.float32),
@@ -258,6 +302,10 @@ class VideoProcessor:
                                 tracker_id=np.array([0], dtype=np.int32),
                             )
                             detections = self._append_synthetic_detection(detections, synth)
+
+                if ball_center_xy is not None and ball_center_xy[0] is not None:
+                    bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
+                   
                 
                 # 3.6 Possession assignment (nearest player to ball)
                 player_mask = detections.class_id == 4
@@ -276,10 +324,8 @@ class VideoProcessor:
                     )
 
                 # 4. Label preparation
-                labels = []
-                for class_id, tracker_id in zip(detections.class_id, detections.tracker_id):
-                    class_name = {0: "Ball", 2: "Hoop", 4: "Player"}.get(class_id, "Unknown")
-                    labels.append(f"{class_name} #{tracker_id}")
+                # We'll draw colored labels ourselves after team assignment.
+                labels = None
                 
                 # 5. Visualization
                 annotated_frame = self.visualizer.draw_detections(
@@ -288,14 +334,105 @@ class VideoProcessor:
                     labels=labels
                 )
 
+                # 5.1 Team clustering + team-specific ellipses for players
+                player_mask = detections.class_id == 4
+                possessor_id_int = int(possessor_id) if possessor_id is not None else None
+                if np.any(player_mask):
+                    player_xyxy = detections.xyxy[player_mask].astype(np.float32)
+                    player_ids = detections.tracker_id[player_mask].astype(int)
+
+                    # Convert xyxy -> xywh expected by team_clustering
+                    bboxes_xywh = []
+                    for bb in player_xyxy:
+                        x1, y1, x2, y2 = bb.tolist()
+                        bboxes_xywh.append([x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)])
+
+                    tc = classify_teams_no_draw(annotated_frame, bboxes_xywh, self.team_cfg)
+                    teams = tc["teams"]
+
+                    # Temporal smoothing via per-track voting
+                    for tid, team in zip(player_ids.tolist(), teams):
+                        if tid not in self._team_votes:
+                            self._team_votes[tid] = np.zeros((2,), dtype=np.float32)
+
+                        if self.team_cfg.temporal_vote_decay and self.team_cfg.temporal_vote_decay > 0:
+                            self._team_votes[tid] *= float(1.0 - self.team_cfg.temporal_vote_decay)
+
+                        if team == "Team A":
+                            self._team_votes[tid][0] += 1.0
+                        else:
+                            self._team_votes[tid][1] += 1.0
+
+                    # Draw ellipses with smoothed label per player
+                    for bb_xywh, tid in zip(bboxes_xywh, player_ids.tolist()):
+                        votes = self._team_votes.get(int(tid), None)
+                        if votes is None:
+                            team_smoothed = "Team A"
+                        else:
+                            team_smoothed = "Team A" if float(votes[0]) >= float(votes[1]) else "Team B"
+                        annotated_frame = draw_player_ellipse(
+                            annotated_frame,
+                            bb_xywh,
+                            team_smoothed,
+                            self.team_cfg,
+                            player_id=None,
+                        )
+
+                    # Draw player IDs above bbox, colored by team / possession
+                    for bb_xyxy, tid in zip(player_xyxy.astype(int).tolist(), player_ids.tolist()):
+                        x1, y1, x2, y2 = (int(bb_xyxy[0]), int(bb_xyxy[1]), int(bb_xyxy[2]), int(bb_xyxy[3]))
+                        votes = self._team_votes.get(int(tid), None)
+                        team_smoothed = "Team A" if votes is None or float(votes[0]) >= float(votes[1]) else "Team B"
+                        if possessor_id_int is not None and int(tid) == possessor_id_int:
+                            color = self.team_cfg.possession_highlight_bgr
+                        else:
+                            color = (
+                                self.team_cfg.ellipse_color_team_a_bgr
+                                if team_smoothed == "Team A"
+                                else self.team_cfg.ellipse_color_team_b_bgr
+                            )
+
+                        text = f"Player #{int(tid)}"
+                        org = (x1, max(0, y1 - 6))
+                        cv2.putText(
+                            annotated_frame,
+                            text,
+                            org,
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            float(self.team_cfg.text_scale),
+                            color,
+                            int(self.team_cfg.text_thickness),
+                            cv2.LINE_AA,
+                        )
+
+                # Draw labels for non-player detections (ball/hoop) in a neutral color
+                neutral = (255, 255, 255)
+                for bb, cls, tid in zip(detections.xyxy.astype(int), detections.class_id, detections.tracker_id):
+                    if int(cls) == 4:
+                        continue
+                    x1, y1, x2, y2 = (int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3]))
+                    class_name = {0: "Ball", 2: "Hoop"}.get(int(cls), "Obj")
+                    text = f"{class_name} #{int(tid)}"
+                    cv2.putText(
+                        annotated_frame,
+                        text,
+                        (x1, max(0, y1 - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        neutral,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
                 # Top overlay: who has the ball
                 if possessor_id is not None:
                     text = f"Player {int(possessor_id)} has ball"
                 else:
                     text = "No possession"
 
-                if possessor_id != self._last_possessor_id and possessor_id is not None:
-                    print(f"Player {int(possessor_id)} has ball")
+                
+               
+               
                 self._last_possessor_id = possessor_id
 
                 cv2.putText(

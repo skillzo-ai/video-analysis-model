@@ -22,7 +22,12 @@ class BallKalmanTracker:
         self._P = None  # (4, 4)
 
         self.last_size_wh = None  # (w, h) from last observed bbox
-        self.last_center = None  # (x, y)
+        self.last_center = None  # (x, y) filtered/current
+        self.prev_center = None  # (x, y) filtered previous
+
+        # For velocity rule: use accepted measurements only
+        self.last_meas_center = None
+        self.prev_meas_center = None
 
     @property
     def initialized(self) -> bool:
@@ -33,12 +38,18 @@ class BallKalmanTracker:
         self._P = None
         self.last_size_wh = None
         self.last_center = None
+        self.prev_center = None
+        self.last_meas_center = None
+        self.prev_meas_center = None
 
     def _init_from_measurement(self, z_xy: np.ndarray):
         x, y = float(z_xy[0]), float(z_xy[1])
         self._x = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
         self._P = np.eye(4, dtype=np.float32) * self.init_var
+        self.prev_center = None
         self.last_center = (x, y)
+        self.prev_meas_center = None
+        self.last_meas_center = (x, y)
 
     def predict(self, dt: float = 1.0) -> tuple[float, float]:
         dt = float(dt)
@@ -69,6 +80,8 @@ class BallKalmanTracker:
         self._P = F @ self._P @ F.T + Q
 
         x, y = float(self._x[0, 0]), float(self._x[1, 0])
+        if self.last_center is not None:
+            self.prev_center = self.last_center
         self.last_center = (x, y)
         return (x, y)
 
@@ -95,8 +108,30 @@ class BallKalmanTracker:
         self._P = (I - (K @ H)) @ self._P
 
         x, y = float(self._x[0, 0]), float(self._x[1, 0])
+        if self.last_center is not None:
+            self.prev_center = self.last_center
         self.last_center = (x, y)
         return (x, y)
+
+    def note_measurement(self, center_xy: tuple[float, float]):
+        """Call only when a real ball detection is accepted."""
+        if self.last_meas_center is not None:
+            self.prev_meas_center = self.last_meas_center
+        self.last_meas_center = (float(center_xy[0]), float(center_xy[1]))
+
+    def velocity_predict_center(self):
+        """
+        Uses user rule:
+          velocity = current_pos - prev_pos
+          predicted = current_pos + velocity
+        Here current_pos/prev_pos are LAST TWO ACCEPTED MEASUREMENTS.
+        """
+        if self.last_meas_center is None or self.prev_meas_center is None:
+            return None
+        cx, cy = self.last_meas_center
+        px, py = self.prev_meas_center
+        vx, vy = (cx - px), (cy - py)
+        return (cx + vx, cy + vy)
 
     def center_to_bbox_xyxy(self, center_xy: tuple[float, float], default_wh: tuple[float, float] = (16.0, 16.0)):
         cx, cy = float(center_xy[0]), float(center_xy[1])
