@@ -5,11 +5,11 @@ import supervision as sv
 class Visualizer:
     def __init__(self):
         """
-        Custom visualizer with ellipses for players.
+        Visualizer for non-player objects (ball/hoop).
+
+        Player visualization is handled by `team_clustering` to ensure
+        team-specific ellipses and label coloring.
         """
-        self.ellipse_annotator = sv.EllipseAnnotator(
-            thickness=2
-        )
         self.box_annotator = sv.BoxAnnotator(
             thickness=2
         )
@@ -21,25 +21,15 @@ class Visualizer:
 
     def draw_detections(self, frame: np.ndarray, detections: sv.Detections, labels: list = None):
         """
-        Annotate frame with ellipses for players and boxes for ball/hoop.
+        Annotate frame with boxes for ball/hoop.
+        Players (class 4) are intentionally not drawn here.
         """
         annotated_frame = frame.copy()
         
-        # Split detections: Players (class 4) vs others
-        player_mask = detections.class_id == 4
-        other_mask = ~player_mask
-        
-        player_detections = detections[player_mask]
+        # Keep only non-player detections (ball/hoop/etc).
+        other_mask = detections.class_id != 4
         other_detections = detections[other_mask]
-        
-        # Draw ellipses for players
-        if len(player_detections) > 0:
-            annotated_frame = self.ellipse_annotator.annotate(
-                scene=annotated_frame, 
-                detections=player_detections
-            )
-        
-        # Draw boxes for ball/hoop
+
         if len(other_detections) > 0:
             annotated_frame = self.box_annotator.annotate(
                 scene=annotated_frame, 
