@@ -5,11 +5,20 @@ from pathlib import Path
 
 import cv2
 
+from detectors.make_miss_detector import MakeMissDetector
+from detectors.pass_detector import PassDetector
+from detectors.shot_detector import ShotDetector
 from detection_pipeline.processor import VideoProcessor
 from team_clustering.config import TeamClusteringConfig
 from team_clustering.pipeline import classify_teams
 
-def run_detection_pipeline(source: str, model_path: str = "best.pt", output_path: str = "output_tracked.mp4"):
+def run_detection_pipeline(
+    source: str,
+    model_path: str = "best.pt",
+    output_path: str = "output_tracked.mp4",
+    *,
+    log_events_all_frames: bool = False,
+):
     """
     Function to be called from FastAPI or other modules.
     """
@@ -19,9 +28,17 @@ def run_detection_pipeline(source: str, model_path: str = "best.pt", output_path
     if not os.path.exists(source):
         raise FileNotFoundError(f"Source video not found: {source}")
 
+    pass_detector = PassDetector()
+    shot_detector = ShotDetector()
+    make_miss_detector = MakeMissDetector()
+
     processor = VideoProcessor(
         model_path=model_path,
-        output_path=output_path
+        output_path=output_path,
+        pass_detector=pass_detector,
+        shot_detector=shot_detector,
+        make_miss_detector=make_miss_detector,
+        log_events_all_frames=log_events_all_frames,
     )
     # Team clustering is integrated inside VideoProcessor (player ellipses).
     processor.process_video(source=source)
@@ -78,6 +95,11 @@ def main():
     detect.add_argument("--source", type=str, required=True, help="Path to input video")
     detect.add_argument("--model", type=str, default="best.pt", help="Path to model weights")
     detect.add_argument("--output", type=str, default="output_tracked.mp4", help="Path to output video")
+    detect.add_argument(
+        "--log-events-all-frames",
+        action="store_true",
+        help="Print pass/shot/make JSON every frame (default: only when any event is True)",
+    )
 
     teams = sub.add_parser("teams", help="Run team clustering on a single image + bboxes JSON")
     teams.add_argument("--image", type=str, required=True, help="Path to input image (frame)")
@@ -89,7 +111,12 @@ def main():
 
     try:
         if args.command == "detect":
-            run_detection_pipeline(source=args.source, model_path=args.model, output_path=args.output)
+            run_detection_pipeline(
+                source=args.source,
+                model_path=args.model,
+                output_path=args.output,
+                log_events_all_frames=bool(args.log_events_all_frames),
+            )
         elif args.command == "teams":
             run_team_clustering_on_image(args.image, args.bboxes, args.output, debug=bool(args.debug))
         else:

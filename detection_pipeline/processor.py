@@ -1,3 +1,4 @@
+import json
 import cv2
 import supervision as sv
 import numpy as np
@@ -11,8 +12,21 @@ from team_clustering.config import TeamClusteringConfig
 from team_clustering.pipeline import classify_teams_no_draw
 from team_clustering.visualization import draw_player_ellipse
 
+from core.tracking import assign_ball_owner
+from models.data_structures import BallState, Hoop, PlayerState
+
+
 class VideoProcessor:
-    def __init__(self, model_path: str, output_path: str = "output_tracked.mp4"):
+    def __init__(
+        self,
+        model_path: str,
+        output_path: str = "output_tracked.mp4",
+        *,
+        pass_detector=None,
+        shot_detector=None,
+        make_miss_detector=None,
+        log_events_all_frames: bool = False,
+    ):
         self.detector = Detector(model_path)
         self.visualizer = Visualizer()
         self.output_path = output_path
@@ -31,6 +45,11 @@ class VideoProcessor:
         self.ball_tracker = BallKalmanTracker(process_var=25.0, meas_var=80.0)
         self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
         self._last_possessor_id = None
+
+        self.pass_detector = pass_detector
+        self.shot_detector = shot_detector
+        self.make_miss_detector = make_miss_detector
+        self.log_events_all_frames = bool(log_events_all_frames)
 
         # Team clustering state (tracker_id -> vote counts)
         self.team_cfg = TeamClusteringConfig(debug=False, draw_text=False)
@@ -322,6 +341,72 @@ class VideoProcessor:
                         player_xyxy=None,
                         player_ids=None,
                     )
+
+                # 3.7 Basketball event detectors (optional plug-in)
+                if (
+                    self.pass_detector is not None
+                    and self.shot_detector is not None
+                    and self.make_miss_detector is not None
+                    and ball_center_xy is not None
+                    and ball_center_xy[0] is not None
+                ):
+                    bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
+                    if (
+                        self.ball_tracker.last_meas_center is not None
+                        and self.ball_tracker.prev_meas_center is not None
+                    ):
+                        lm = self.ball_tracker.last_meas_center
+                        pm = self.ball_tracker.prev_meas_center
+                        bvx, bvy = float(lm[0] - pm[0]), float(lm[1] - pm[1])
+                    else:
+                        bvx, bvy = 0.0, 0.0
+                    ball_state = BallState(position=(bx, by), velocity=(bvx, bvy))
+
+                    player_states: list[PlayerState] = []
+                    if np.any(player_mask):
+                        for j in np.where(player_mask)[0]:
+                            bb = detections.xyxy[int(j)].astype(np.float32)
+                            cx = (float(bb[0]) + float(bb[2])) * 0.5
+                            cy = (float(bb[1]) + float(bb[3])) * 0.5
+                            pid = int(detections.tracker_id[int(j)])
+                            player_states.append(PlayerState(player_id=pid, position=(cx, cy)))
+
+                    centers = [p.position for p in player_states]
+                    pids = [p.player_id for p in player_states]
+                    owner_for_events, _ = (
+                        assign_ball_owner((bx, by), centers, pids)
+                        if player_states
+                        else (None, None)
+                    )
+
+                    hoop_state = None
+                    hoop_mask = detections.class_id == 2
+                    if np.any(hoop_mask):
+                        hi = int(np.where(hoop_mask)[0][0])
+                        hbb = detections.xyxy[hi].astype(np.float32)
+                        hoop_state = Hoop(
+                            bbox=(
+                                float(hbb[0]),
+                                float(hbb[1]),
+                                float(hbb[2]),
+                                float(hbb[3]),
+                            )
+                        )
+
+                    pass_evt = self.pass_detector.detect(
+                        ball_state, player_states, owner_for_events
+                    )
+                    shot_evt = self.shot_detector.detect(ball_state, hoop_state)
+                    make_evt = self.make_miss_detector.detect(ball_state, hoop_state)
+
+                    payload = {
+                        "frame": frame_idx,
+                        "pass": bool(pass_evt),
+                        "shot": bool(shot_evt),
+                        "make": bool(make_evt),
+                    }
+                    if self.log_events_all_frames or pass_evt or shot_evt or make_evt:
+                        print(json.dumps(payload))
 
                 # 4. Label preparation
                 # We'll draw colored labels ourselves after team assignment.
