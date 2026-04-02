@@ -11,3 +11,7 @@ wheels/
 
 
 data
+
+# Model weights (GitHub hard limit 100 MB — use Releases, LFS, or external storage)
+*.pt
+*.onnx
