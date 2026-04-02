@@ -1,0 +1,12 @@
+{
+  "team_A": {
+    "passes": 5,
+    "shots": 3,
+    "makes": 0
+  },
+  "team_B": {
+    "passes": 0,
+    "shots": 0,
+    "makes": 0
+  }
+}

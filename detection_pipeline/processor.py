@@ -251,7 +251,7 @@ class VideoProcessor:
         video_info = sv.VideoInfo.from_video_path(source)
         frame_generator = sv.get_video_frames_generator(source)
         
-        with sv.VideoSink(self.output_path, video_info) as sink:
+        with sv.VideoSink(self.output_path, video_info, codec="mp4v") as sink:
             frame_idx = 0
             for frame in frame_generator:
                 frame_idx += 1
