@@ -5,7 +5,7 @@ import numpy as np
 from .detector import Detector
 from .visualize import Visualizer
 from .reid import PlayerReID, cosine_similarity
-from .ball_kalman import BallKalmanTracker
+from .ball_deepsort import BallDeepOcSortTracker
 from .possession import PossessionAssigner
 
 from team_clustering.config import TeamClusteringConfig
@@ -42,9 +42,12 @@ class VideoProcessor:
         self.id_map = {}    # current_tracker_id -> original_id (for Re-ID remapping)
         self.next_reid_id = 1
         self.similarity_threshold = 0.85 # Threshold for visual match
-        self.ball_tracker = BallKalmanTracker(process_var=25.0, meas_var=80.0)
+        # DeepOcSort: Kalman bbox + ReID association (BoxMOT; closest to DeepSORT in this stack).
+        self.ball_tracker = BallDeepOcSortTracker()
         self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
         self._last_possessor_id = None
+        # Per-frame delta of *tracked* ball center for event detectors (stable vs raw meas. pairs).
+        self._prev_ball_center_events: tuple[float, float] | None = None
 
         self.pass_detector = pass_detector
         self.shot_detector = shot_detector
@@ -54,6 +57,10 @@ class VideoProcessor:
         # Team clustering state (tracker_id -> vote counts)
         self.team_cfg = TeamClusteringConfig(debug=False, draw_text=False)
         self._team_votes = {}  # tid -> np.array([votes_teamA, votes_teamB], float32)
+        self._team_stats = {
+            "Team A": {"passes": 0, "shots": 0, "makes": 0},
+            "Team B": {"passes": 0, "shots": 0, "makes": 0},
+        }
 
     @staticmethod
     def _append_synthetic_detection(base: sv.Detections, extra: sv.Detections) -> sv.Detections:
@@ -136,6 +143,90 @@ class VideoProcessor:
             tracker_id=tracker_id,
             data=out_data,
         )
+
+    def _team_label_for_player(self, player_id: int) -> str:
+        votes = self._team_votes.get(int(player_id))
+        if votes is None:
+            return "Team A"
+        return "Team A" if float(votes[0]) >= float(votes[1]) else "Team B"
+
+    def _bump_team_stat(self, team: str, stat_key: str) -> None:
+        bucket = self._team_stats.get(team)
+        if bucket is not None and stat_key in bucket:
+            bucket[stat_key] += 1
+
+    def team_stats_export_dict(self) -> dict:
+        """Stats for JSON export (keys team_A / team_B)."""
+        a = self._team_stats["Team A"]
+        b = self._team_stats["Team B"]
+        return {
+            "team_A": {
+                "passes": int(a["passes"]),
+                "shots": int(a["shots"]),
+                "makes": int(a["makes"]),
+            },
+            "team_B": {
+                "passes": int(b["passes"]),
+                "shots": int(b["shots"]),
+                "makes": int(b["makes"]),
+            },
+        }
+
+    @staticmethod
+    def _draw_team_stats_panel(
+        bgr: np.ndarray,
+        stats_a: dict[str, int],
+        stats_b: dict[str, int],
+        color_a: tuple[int, int, int],
+        color_b: tuple[int, int, int],
+    ) -> None:
+        h, w = bgr.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.52
+        thick = 1
+        line_h = 21
+        margin = 10
+        pad = 6
+
+        def lines_for(team_name: str, st: dict[str, int]) -> list[tuple[str, tuple[int, int, int]]]:
+            hdr_color = color_a if team_name == "Team A" else color_b
+            return [
+                (team_name, hdr_color),
+                (f"Passes: {st['passes']}", (240, 240, 240)),
+                (f"Shots:  {st['shots']}", (240, 240, 240)),
+                (f"Makes:  {st['makes']}", (240, 240, 240)),
+            ]
+
+        block_a = lines_for("Team A", stats_a)
+        block_b = lines_for("Team B", stats_b)
+        gap_lines = 1
+        all_rows: list[tuple[str, tuple[int, int, int]]] = block_a + [("", (0, 0, 0))] * gap_lines + block_b
+
+        max_tw = 0
+        for text, _ in all_rows:
+            if not text:
+                continue
+            (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+            max_tw = max(max_tw, tw)
+
+        total_h = sum(line_h if t else line_h // 2 for t, _ in all_rows) + pad * 2
+        x1 = int(w - margin - max_tw - pad * 2)
+        y1 = margin
+        x2 = w - margin
+        y2 = min(h - margin, y1 + total_h)
+        cv2.rectangle(bgr, (x1, y1), (x2, y2), (28, 28, 32), -1)
+        cv2.rectangle(bgr, (x1, y1), (x2, y2), (72, 72, 78), 1)
+
+        cx = x1 + pad
+        cy = y1 + pad + 16
+        for text, color in all_rows:
+            if not text:
+                cy += line_h // 2
+                continue
+            (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+            tx = x2 - pad - tw
+            cv2.putText(bgr, text, (tx, cy), font, scale, color, thick, cv2.LINE_AA)
+            cy += line_h
 
     @staticmethod
     def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> float:
@@ -262,7 +353,7 @@ class VideoProcessor:
                 # Update detections with re-mapped IDs
                 detections.tracker_id = np.array(new_tracker_ids)
 
-                # 3.5 Ball Kalman tracking (ensure ball exists every frame)
+                # 3.5 Ball track (DeepOcSort) + synthetic ball when needed
                 ball_mask = detections.class_id == 0
                 ball_center_xy = None
                 ball_source = "none"
@@ -270,31 +361,34 @@ class VideoProcessor:
                 if np.any(ball_mask):
                     ball_idx = int(np.where(ball_mask)[0][0])
                     b = detections.xyxy[ball_idx].astype(np.float32)
-                    bc = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
-                    self.ball_tracker.last_size_wh = (float(b[2] - b[0]), float(b[3] - b[1]))
+                    conf = (
+                        float(detections.confidence[ball_idx])
+                        if detections.confidence is not None
+                        else 0.25
+                    )
 
-                    # Accept detection; tracker's filtered center is what we draw/use.
-                    ball_center_xy = self.ball_tracker.update(bc)
-                    self.ball_tracker.note_measurement(bc)
-                    ball_source = "det"
+                    ball_center_xy, tracked_bb = self.ball_tracker.update(frame, b, conf)
+                    if ball_center_xy is None or tracked_bb is None:
+                        bc = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
+                        ball_center_xy = bc
+                        tracked_bb = b.copy()
+                        ball_source = "det_raw"
+                    else:
+                        detections.xyxy[ball_idx] = tracked_bb
+                        ball_source = "det"
 
-                    # Force displayed bbox to follow tracker output (prevents "stuck box")
-                    tracked_bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
-                    detections.xyxy[ball_idx] = tracked_bb
-
-                    # Force stable ball id for downstream logic/visuals
                     try:
                         detections.tracker_id[ball_idx] = 0
                     except Exception:
                         pass
                 else:
-                    # No detection: predicted = current_pos + (current_pos - prev_pos)
                     if not self.ball_tracker.initialized:
-                        # Must have a ball every frame: initialize at frame center until first real detection arrives.
                         h, w = frame.shape[:2]
-                        ball_center_xy = self.ball_tracker.update((w * 0.5, h * 0.5))
+                        ball_center_xy = (float(w * 0.5), float(h * 0.5))
                         ball_source = "init_center"
-                        bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
+                        bb = self.ball_tracker.center_to_bbox_xyxy(
+                            ball_center_xy, default_wh=(16.0, 16.0)
+                        )
                         synth = sv.Detections(
                             xyxy=np.array([bb], dtype=np.float32),
                             confidence=np.array([0.01], dtype=np.float32),
@@ -303,17 +397,11 @@ class VideoProcessor:
                         )
                         detections = self._append_synthetic_detection(detections, synth)
                     else:
-                        vel_pred_center = self.ball_tracker.velocity_predict_center()
-                        if vel_pred_center is None:
-                            # fallback to Kalman predict if we don't have two centers yet
-                            ball_center_xy = self.ball_tracker.predict(dt=1.0)
-                            ball_source = "kalman_pred"
-                        else:
-                            ball_center_xy = self.ball_tracker.update(vel_pred_center)
-                            ball_source = "vel_pred"
+                        ball_center_xy, tracked_bb = self.ball_tracker.update(frame, None, 0.0)
+                        ball_source = "deepsort_kalman"
 
-                        if ball_center_xy is not None and ball_center_xy[0] is not None:
-                            bb = self.ball_tracker.center_to_bbox_xyxy(ball_center_xy, default_wh=(16.0, 16.0))
+                        if ball_center_xy is not None and tracked_bb is not None:
+                            bb = np.asarray(tracked_bb, dtype=np.float32)
                             synth = sv.Detections(
                                 xyxy=np.array([bb], dtype=np.float32),
                                 confidence=np.array([0.01], dtype=np.float32),
@@ -351,15 +439,12 @@ class VideoProcessor:
                     and ball_center_xy[0] is not None
                 ):
                     bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
-                    if (
-                        self.ball_tracker.last_meas_center is not None
-                        and self.ball_tracker.prev_meas_center is not None
-                    ):
-                        lm = self.ball_tracker.last_meas_center
-                        pm = self.ball_tracker.prev_meas_center
-                        bvx, bvy = float(lm[0] - pm[0]), float(lm[1] - pm[1])
+                    if self._prev_ball_center_events is not None:
+                        px, py = self._prev_ball_center_events
+                        bvx, bvy = bx - px, by - py
                     else:
                         bvx, bvy = 0.0, 0.0
+                    self._prev_ball_center_events = (bx, by)
                     ball_state = BallState(position=(bx, by), velocity=(bvx, bvy))
 
                     player_states: list[PlayerState] = []
@@ -407,6 +492,21 @@ class VideoProcessor:
                     }
                     if self.log_events_all_frames or pass_evt or shot_evt or make_evt:
                         print(json.dumps(payload))
+
+                    if pass_evt and self.pass_detector.last_pass_from_id is not None:
+                        tid_pass = int(self.pass_detector.last_pass_from_id)
+                        self._bump_team_stat(self._team_label_for_player(tid_pass), "passes")
+                    if shot_evt and owner_for_events is not None:
+                        self._bump_team_stat(
+                            self._team_label_for_player(int(owner_for_events)), "shots"
+                        )
+                    if make_evt and owner_for_events is not None:
+                        self._bump_team_stat(
+                            self._team_label_for_player(int(owner_for_events)), "makes"
+                        )
+
+                if ball_center_xy is None or ball_source == "init_center":
+                    self._prev_ball_center_events = None
 
                 # 4. Label preparation
                 # We'll draw colored labels ourselves after team assignment.
@@ -530,8 +630,14 @@ class VideoProcessor:
                     2,
                     cv2.LINE_AA,
                 )
-                
+
+                self._draw_team_stats_panel(
+                    annotated_frame,
+                    self._team_stats["Team A"],
+                    self._team_stats["Team B"],
+                    self.team_cfg.ellipse_color_team_a_bgr,
+                    self.team_cfg.ellipse_color_team_b_bgr,
+                )
+
                 # 6. Write frame
                 sink.write_frame(annotated_frame)
-                
-        print(f"Tracking complete. Saved to: {self.output_path}")

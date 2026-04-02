@@ -21,11 +21,15 @@ class PassDetector:
         self._prev_owner_id: int | None = None
         self._prev_owner_pos: tuple[float, float] | None = None
         self._cooldown_remaining: int = 0
+        self.last_pass_from_id: int | None = None
+        self.last_pass_to_id: int | None = None
 
     def reset(self) -> None:
         self._prev_owner_id = None
         self._prev_owner_pos = None
         self._cooldown_remaining = 0
+        self.last_pass_from_id = None
+        self.last_pass_to_id = None
 
     def detect(
         self,
@@ -42,6 +46,8 @@ class PassDetector:
 
         pos_by_id = {int(p.player_id): p.position for p in players}
         fired = False
+        self.last_pass_from_id = None
+        self.last_pass_to_id = None
 
         if owner_id is not None:
             current_pos = pos_by_id.get(int(owner_id))
@@ -56,6 +62,8 @@ class PassDetector:
                 if dist > self.distance_threshold and can_fire:
                     fired = True
                     self._cooldown_remaining = self.cooldown_frames
+                    self.last_pass_from_id = int(self._prev_owner_id)
+                    self.last_pass_to_id = int(owner_id)
 
             if current_pos is not None:
                 self._prev_owner_pos = current_pos

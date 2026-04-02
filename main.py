@@ -15,18 +15,44 @@ from team_clustering.pipeline import classify_teams
 def run_detection_pipeline(
     source: str,
     model_path: str = "best.pt",
-    output_path: str = "output_tracked.mp4",
+    output_path: str | None = None,
     *,
+    output_folder: str | None = None,
     log_events_all_frames: bool = False,
-):
+) -> dict[str, str]:
     """
-    Function to be called from FastAPI or other modules.
+    Run tracking on `source` and write:
+      - Tracked video: ``{input_stem}_tracked.mp4``
+      - Stats JSON: ``{input_stem}.json`` with team_A / team_B counts.
+
+    If ``output_folder`` is set, both files go under that directory (created if needed).
+    If only ``output_path`` is set (legacy), that path is used for the video and the JSON
+    is written next to it as ``{input_stem}.json``.
+    If neither is set, defaults to folder ``output`` under the current working directory.
     """
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    
+
     if not os.path.exists(source):
         raise FileNotFoundError(f"Source video not found: {source}")
+
+    source_path = Path(source)
+    input_stem = source_path.stem
+
+    if output_folder is not None:
+        out_dir = Path(output_folder)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        video_out = out_dir / f"{input_stem}_tracked.mp4"
+        json_out = out_dir / f"{input_stem}.json"
+    elif output_path is not None:
+        video_out = Path(output_path)
+        video_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out = video_out.parent / f"{input_stem}.json"
+    else:
+        out_dir = Path("output")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        video_out = out_dir / f"{input_stem}_tracked.mp4"
+        json_out = out_dir / f"{input_stem}.json"
 
     pass_detector = PassDetector()
     shot_detector = ShotDetector()
@@ -34,15 +60,21 @@ def run_detection_pipeline(
 
     processor = VideoProcessor(
         model_path=model_path,
-        output_path=output_path,
+        output_path=str(video_out),
         pass_detector=pass_detector,
         shot_detector=shot_detector,
         make_miss_detector=make_miss_detector,
         log_events_all_frames=log_events_all_frames,
     )
-    # Team clustering is integrated inside VideoProcessor (player ellipses).
     processor.process_video(source=source)
-    return output_path
+
+    stats = processor.team_stats_export_dict()
+    with open(json_out, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2)
+
+    print(f"Tracking complete. Video: {video_out}")
+    print(f"Stats JSON: {json_out}")
+    return {"video": str(video_out), "stats_json": str(json_out)}
 
 
 def run_team_clustering_on_image(
@@ -94,7 +126,18 @@ def main():
     detect = sub.add_parser("detect", help="Run detection + tracking on a video")
     detect.add_argument("--source", type=str, required=True, help="Path to input video")
     detect.add_argument("--model", type=str, default="best.pt", help="Path to model weights")
-    detect.add_argument("--output", type=str, default="output_tracked.mp4", help="Path to output video")
+    detect.add_argument(
+        "--output-folder",
+        type=str,
+        default=None,
+        help="Directory for {input_name}_tracked.mp4 and {input_name}.json (default: ./output)",
+    )
+    detect.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Explicit path for tracked video only; stats JSON is written beside it as {input_stem}.json",
+    )
     detect.add_argument(
         "--log-events-all-frames",
         action="store_true",
@@ -111,10 +154,16 @@ def main():
 
     try:
         if args.command == "detect":
+            out_folder = args.output_folder
+            if out_folder is None and args.output is None:
+                out_folder = "output"
+            # If --output-folder is set, it controls both files; --output is ignored.
+            legacy_video = args.output if args.output_folder is None else None
             run_detection_pipeline(
                 source=args.source,
                 model_path=args.model,
-                output_path=args.output,
+                output_path=legacy_video,
+                output_folder=out_folder,
                 log_events_all_frames=bool(args.log_events_all_frames),
             )
         elif args.command == "teams":
