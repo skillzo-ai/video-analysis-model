@@ -15,3 +15,5 @@ data
 # Model weights (GitHub hard limit 100 MB — use Releases, LFS, or external storage)
 *.pt
 *.onnx
+*.mp4
+output/

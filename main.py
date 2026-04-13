@@ -11,6 +11,8 @@ from detectors.shot_detector import ShotDetector
 from detection_pipeline.processor import VideoProcessor
 from team_clustering.config import TeamClusteringConfig
 from team_clustering.pipeline import classify_teams
+from team_clustering.temporal_team_classification import TemporalTeamConfig
+from tracking import TrackingConfig
 
 def run_detection_pipeline(
     source: str,
@@ -19,11 +21,13 @@ def run_detection_pipeline(
     *,
     output_folder: str | None = None,
     log_events_all_frames: bool = False,
+    tracking_config: TrackingConfig | dict | None = None,
+    temporal_team_config: TemporalTeamConfig | dict | None = None,
 ) -> dict[str, str]:
     """
     Run tracking on `source` and write:
       - Tracked video: ``{input_stem}_tracked.mp4``
-      - Stats JSON: ``{input_stem}.json`` with team_A / team_B counts.
+      - Stats JSON: ``{input_stem}.json`` with team_A / team_B counts and ``track_teams`` (ByteTrack id → Team A/B).
 
     If ``output_folder`` is set, both files go under that directory (created if needed).
     If only ``output_path`` is set (legacy), that path is used for the video and the JSON
@@ -58,6 +62,17 @@ def run_detection_pipeline(
     shot_detector = ShotDetector()
     make_miss_detector = MakeMissDetector()
 
+    tc = (
+        TrackingConfig.from_dict(tracking_config)
+        if isinstance(tracking_config, dict)
+        else tracking_config
+    )
+    tteam = (
+        TemporalTeamConfig.from_dict(temporal_team_config)
+        if isinstance(temporal_team_config, dict)
+        else temporal_team_config
+    )
+
     processor = VideoProcessor(
         model_path=model_path,
         output_path=str(video_out),
@@ -65,10 +80,13 @@ def run_detection_pipeline(
         shot_detector=shot_detector,
         make_miss_detector=make_miss_detector,
         log_events_all_frames=log_events_all_frames,
+        tracking_config=tc,
+        temporal_team_config=tteam,
     )
     processor.process_video(source=source)
 
     stats = processor.team_stats_export_dict()
+    stats["track_teams"] = processor.export_team_track_json()
     with open(json_out, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
