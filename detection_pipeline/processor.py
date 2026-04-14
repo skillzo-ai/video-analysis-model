@@ -4,16 +4,16 @@ import supervision as sv
 import numpy as np
 from .detector import Detector
 from .visualize import Visualizer
-from .reid import PlayerReID, cosine_similarity
 from .ball_deepsort import BallDeepOcSortTracker
 from .possession import PossessionAssigner
 
 from team_clustering.config import TeamClusteringConfig
-from team_clustering.pipeline import classify_teams_no_draw
+from team_clustering.temporal_team_classification import TemporalTeamClassifier, TemporalTeamConfig
 from team_clustering.visualization import draw_player_ellipse
 
 from core.tracking import assign_ball_owner
 from models.data_structures import BallState, Hoop, PlayerState
+from tracking import FrameTrackingPipeline, TrackingConfig
 
 
 class VideoProcessor:
@@ -26,22 +26,13 @@ class VideoProcessor:
         shot_detector=None,
         make_miss_detector=None,
         log_events_all_frames: bool = False,
+        tracking_config: TrackingConfig | None = None,
+        temporal_team_config: TemporalTeamConfig | None = None,
     ):
         self.detector = Detector(model_path)
         self.visualizer = Visualizer()
         self.output_path = output_path
-        self.tracker = sv.ByteTrack(
-            track_activation_threshold=0.25, 
-            lost_track_buffer=150, # Increased further
-            minimum_matching_threshold=0.8
-        )
-        self.reid = PlayerReID()
-        
-        # ID memory
-        self.id_memory = {} # tracker_id -> list of embeddings
-        self.id_map = {}    # current_tracker_id -> original_id (for Re-ID remapping)
-        self.next_reid_id = 1
-        self.similarity_threshold = 0.85 # Threshold for visual match
+        self.frame_tracking = FrameTrackingPipeline(tracking_config or TrackingConfig())
         # DeepOcSort: Kalman bbox + ReID association (BoxMOT; closest to DeepSORT in this stack).
         self.ball_tracker = BallDeepOcSortTracker()
         self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
@@ -54,9 +45,8 @@ class VideoProcessor:
         self.make_miss_detector = make_miss_detector
         self.log_events_all_frames = bool(log_events_all_frames)
 
-        # Team clustering state (tracker_id -> vote counts)
-        self.team_cfg = TeamClusteringConfig(debug=False, draw_text=False)
-        self._team_votes = {}  # tid -> np.array([votes_teamA, votes_teamB], float32)
+        # Two-team classification: HSV KMeans + temporal majority vote (see temporal_team_classification).
+        self.team_classifier = TemporalTeamClassifier(temporal_team_config or TemporalTeamConfig())
         self._team_stats = {
             "Team A": {"passes": 0, "shots": 0, "makes": 0},
             "Team B": {"passes": 0, "shots": 0, "makes": 0},
@@ -145,10 +135,11 @@ class VideoProcessor:
         )
 
     def _team_label_for_player(self, player_id: int) -> str:
-        votes = self._team_votes.get(int(player_id))
-        if votes is None:
-            return "Team A"
-        return "Team A" if float(votes[0]) >= float(votes[1]) else "Team B"
+        return self.team_classifier.get_team(int(player_id))
+
+    def export_team_track_json(self) -> dict[str, str]:
+        """``track_id`` -> ``Team A`` / ``Team B`` (for JSON export alongside video)."""
+        return self.team_classifier.export_track_team_json()
 
     def _bump_team_stat(self, team: str, stat_key: str) -> None:
         bucket = self._team_stats.get(team)
@@ -249,18 +240,24 @@ class VideoProcessor:
         Process the video frame-by-frame with tracking and visual Re-ID.
         """
         video_info = sv.VideoInfo.from_video_path(source)
+        video_fps = float(getattr(video_info, "fps", None) or 0.0)
+        if video_fps <= 1e-6:
+            video_fps = 30.0
         frame_generator = sv.get_video_frames_generator(source)
-        
+
         with sv.VideoSink(self.output_path, video_info, codec="mp4v") as sink:
             frame_idx = 0
             for frame in frame_generator:
                 frame_idx += 1
+                time_sec = (frame_idx - 1) / video_fps
                 # 1. Detection
                 detections = self.detector.get_detections(frame)
-                
-                # 2. Tracking
-                detections = self.tracker.update_with_detections(detections)
-                
+
+                # 2. ByteTrack + Re-ID (appearance / jersey / height) + optional Kalman (reusable module)
+                detections, _frame_track_result = self.frame_tracking.step(
+                    frame, detections, frame_index=frame_idx
+                )
+
                 # --- NEW: Ball Filtering Logic ---
                 # If there are multiple balls, keep only the one nearest to the highest-confidence player
                 ball_mask = detections.class_id == 0
@@ -303,57 +300,7 @@ class VideoProcessor:
                         detections = detections[final_mask]
                 # ---------------------------------
 
-                # 3. Visual Re-ID for players (class 4)
-                new_tracker_ids = []
-                for i in range(len(detections)):
-                    bbox = detections.xyxy[i].astype(int)
-                    tid = detections.tracker_id[i]
-                    cls = detections.class_id[i]
-                    
-                    if cls == 4: # Player
-                        # Crop and extract embedding
-                        crop = frame[max(0, bbox[1]):bbox[3], max(0, bbox[0]):bbox[2]]
-                        embedding = self.reid.extract_embedding(crop)
-                        
-                        if embedding is not None:
-                            # Re-ID logic
-                            if tid not in self.id_map:
-                                # New track ID from ByteTrack. Check if it matches a known player's appearance.
-                                matched_id = None
-                                best_sim = -1
-                                
-                                for old_id, saved_embeddings in self.id_memory.items():
-                                    # Compare against last 5 embeddings of this player
-                                    sims = [cosine_similarity(embedding, e) for e in saved_embeddings[-5:]]
-                                    max_sim = max(sims) if sims else 0
-                                    
-                                    if max_sim > self.similarity_threshold and max_sim > best_sim:
-                                        best_sim = max_sim
-                                        matched_id = old_id
-                                
-                                if matched_id is not None:
-                                    # Match found! Map this new tracker ID to our stored player ID
-                                    self.id_map[tid] = matched_id
-                                else:
-                                    # Truly new player? Or first time seeing this tracker ID
-                                    self.id_map[tid] = tid
-                            
-                            # Store embedding for the mapped ID
-                            mapped_id = self.id_map[tid]
-                            if mapped_id not in self.id_memory:
-                                self.id_memory[mapped_id] = []
-                            self.id_memory[mapped_id].append(embedding)
-                            
-                        # Use mapped ID
-                        new_tracker_ids.append(self.id_map.get(tid, tid))
-                    else:
-                        # Ball or Hoop - just use original tracker ID
-                        new_tracker_ids.append(tid)
-
-                # Update detections with re-mapped IDs
-                detections.tracker_id = np.array(new_tracker_ids)
-
-                # 3.5 Ball track (DeepOcSort) + synthetic ball when needed
+                # 3. Ball track (DeepOcSort) + synthetic ball when needed
                 ball_mask = detections.class_id == 0
                 ball_center_xy = None
                 ball_source = "none"
@@ -512,81 +459,80 @@ class VideoProcessor:
                 # We'll draw colored labels ourselves after team assignment.
                 labels = None
                 
-                # 5. Visualization
+                # 5. Visualization (ball/hoop via supervision; players drawn with team colors)
                 annotated_frame = self.visualizer.draw_detections(
                     frame=frame, 
                     detections=detections, 
                     labels=labels
                 )
 
-                # 5.1 Team clustering + team-specific ellipses for players
+                # 5.1 Robust two-team classification (HSV KMeans + temporal majority) + foot ellipses (legacy style)
                 player_mask = detections.class_id == 4
                 possessor_id_int = int(possessor_id) if possessor_id is not None else None
+                tcfg = self.team_classifier.cfg
+                ellipse_cfg = TeamClusteringConfig(
+                    debug=False,
+                    draw_text=False,
+                    ellipse_color_team_a_bgr=tcfg.color_team_a_bgr,
+                    ellipse_color_team_b_bgr=tcfg.color_team_b_bgr,
+                    possession_highlight_bgr=tcfg.possession_highlight_bgr,
+                )
                 if np.any(player_mask):
                     player_xyxy = detections.xyxy[player_mask].astype(np.float32)
                     player_ids = detections.tracker_id[player_mask].astype(int)
-
-                    # Convert xyxy -> xywh expected by team_clustering
-                    bboxes_xywh = []
+                    confs = (
+                        detections.confidence[player_mask]
+                        if detections.confidence is not None
+                        else None
+                    )
+                    team_labels, _ = self.team_classifier.update_frame(
+                        annotated_frame,
+                        player_xyxy,
+                        player_ids,
+                        confidences=confs,
+                        time_sec=time_sec,
+                    )
+                    bboxes_xywh: list[list[float]] = []
                     for bb in player_xyxy:
                         x1, y1, x2, y2 = bb.tolist()
-                        bboxes_xywh.append([x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)])
+                        bboxes_xywh.append(
+                            [x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)]
+                        )
 
-                    tc = classify_teams_no_draw(annotated_frame, bboxes_xywh, self.team_cfg)
-                    teams = tc["teams"]
-
-                    # Temporal smoothing via per-track voting
-                    for tid, team in zip(player_ids.tolist(), teams):
-                        if tid not in self._team_votes:
-                            self._team_votes[tid] = np.zeros((2,), dtype=np.float32)
-
-                        if self.team_cfg.temporal_vote_decay and self.team_cfg.temporal_vote_decay > 0:
-                            self._team_votes[tid] *= float(1.0 - self.team_cfg.temporal_vote_decay)
-
-                        if team == "Team A":
-                            self._team_votes[tid][0] += 1.0
-                        else:
-                            self._team_votes[tid][1] += 1.0
-
-                    # Draw ellipses with smoothed label per player
-                    for bb_xywh, tid in zip(bboxes_xywh, player_ids.tolist()):
-                        votes = self._team_votes.get(int(tid), None)
-                        if votes is None:
-                            team_smoothed = "Team A"
-                        else:
-                            team_smoothed = "Team A" if float(votes[0]) >= float(votes[1]) else "Team B"
+                    for bb_xywh, team_smoothed in zip(bboxes_xywh, team_labels):
                         annotated_frame = draw_player_ellipse(
                             annotated_frame,
                             bb_xywh,
                             team_smoothed,
-                            self.team_cfg,
+                            ellipse_cfg,
                             player_id=None,
                         )
 
-                    # Draw player IDs above bbox, colored by team / possession
                     for bb_xyxy, tid in zip(player_xyxy.astype(int).tolist(), player_ids.tolist()):
-                        x1, y1, x2, y2 = (int(bb_xyxy[0]), int(bb_xyxy[1]), int(bb_xyxy[2]), int(bb_xyxy[3]))
-                        votes = self._team_votes.get(int(tid), None)
-                        team_smoothed = "Team A" if votes is None or float(votes[0]) >= float(votes[1]) else "Team B"
+                        x1, y1, x2, y2 = (
+                            int(bb_xyxy[0]),
+                            int(bb_xyxy[1]),
+                            int(bb_xyxy[2]),
+                            int(bb_xyxy[3]),
+                        )
+                        team_smoothed = self.team_classifier.get_team(int(tid))
                         if possessor_id_int is not None and int(tid) == possessor_id_int:
-                            color = self.team_cfg.possession_highlight_bgr
+                            color = ellipse_cfg.possession_highlight_bgr
                         else:
                             color = (
-                                self.team_cfg.ellipse_color_team_a_bgr
+                                ellipse_cfg.ellipse_color_team_a_bgr
                                 if team_smoothed == "Team A"
-                                else self.team_cfg.ellipse_color_team_b_bgr
+                                else ellipse_cfg.ellipse_color_team_b_bgr
                             )
-
                         text = f"Player #{int(tid)}"
-                        org = (x1, max(0, y1 - 6))
                         cv2.putText(
                             annotated_frame,
                             text,
-                            org,
+                            (x1, max(0, y1 - 6)),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            float(self.team_cfg.text_scale),
+                            float(ellipse_cfg.text_scale),
                             color,
-                            int(self.team_cfg.text_thickness),
+                            int(ellipse_cfg.text_thickness),
                             cv2.LINE_AA,
                         )
 
@@ -631,13 +577,32 @@ class VideoProcessor:
                     cv2.LINE_AA,
                 )
 
+                cal_dur = float(self.team_classifier.cfg.calibration_duration_sec)
+                if cal_dur > 0 and self.team_classifier.is_in_calibration_window(time_sec):
+                    cal_txt = (
+                        f"Team calibration: {time_sec:.1f}s / {cal_dur:.0f}s (majority, then fixed)"
+                    )
+                    cv2.putText(
+                        annotated_frame,
+                        cal_txt,
+                        (20, 78),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (200, 200, 200),
+                        1,
+                        cv2.LINE_AA,
+                    )
+
                 self._draw_team_stats_panel(
                     annotated_frame,
                     self._team_stats["Team A"],
                     self._team_stats["Team B"],
-                    self.team_cfg.ellipse_color_team_a_bgr,
-                    self.team_cfg.ellipse_color_team_b_bgr,
+                    tcfg.color_team_a_bgr,
+                    tcfg.color_team_b_bgr,
                 )
 
                 # 6. Write frame
                 sink.write_frame(annotated_frame)
+
+        # Majority lock for short clips + final labels for JSON export
+        self.team_classifier.finalize_teams()
