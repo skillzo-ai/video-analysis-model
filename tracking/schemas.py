@@ -16,7 +16,7 @@ class TrackingConfig:
     """
     Tunables for multi-object tracking aligned with ByteTrack + Re-ID + Kalman smoothing.
 
-    Deep appearance association for the ball is handled separately in ``BallDeepOcSortTracker``;
+    Ball position is supplied separately (``BallTracker`` + merge into detections before this step);
     for players, persistent identity across occlusions / exit-reentry uses visual Re-ID plus
     optional jersey color and bbox-height cues.
     """

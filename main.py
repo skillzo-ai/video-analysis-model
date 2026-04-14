@@ -19,6 +19,9 @@ def run_detection_pipeline(
     model_path: str = "best.pt",
     output_path: str | None = None,
     *,
+    ball_model_path: str = "ball_detector_model.pt",
+    ball_read_stub: bool = False,
+    ball_stub_path: str | None = None,
     output_folder: str | None = None,
     log_events_all_frames: bool = False,
     tracking_config: TrackingConfig | dict | None = None,
@@ -36,6 +39,8 @@ def run_detection_pipeline(
     """
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
+    if not os.path.exists(ball_model_path):
+        raise FileNotFoundError(f"Ball model file not found: {ball_model_path}")
 
     if not os.path.exists(source):
         raise FileNotFoundError(f"Source video not found: {source}")
@@ -75,6 +80,9 @@ def run_detection_pipeline(
 
     processor = VideoProcessor(
         model_path=model_path,
+        ball_model_path=ball_model_path,
+        ball_read_stub=ball_read_stub,
+        ball_stub_path=ball_stub_path,
         output_path=str(video_out),
         pass_detector=pass_detector,
         shot_detector=shot_detector,
@@ -143,7 +151,24 @@ def main():
 
     detect = sub.add_parser("detect", help="Run detection + tracking on a video")
     detect.add_argument("--source", type=str, required=True, help="Path to input video")
-    detect.add_argument("--model", type=str, default="best.pt", help="Path to model weights")
+    detect.add_argument("--model", type=str, default="best.pt", help="Path to main YOLO weights (players, hoops; ball class ignored)")
+    detect.add_argument(
+        "--ball-model",
+        type=str,
+        default="ball_detector_model.pt",
+        help="Path to ball-only YOLO weights (BallTracker batch pipeline)",
+    )
+    detect.add_argument(
+        "--ball-stub",
+        type=str,
+        default=None,
+        help="Optional pickle path to cache ball tracks (load with --read-ball-stub, always saved after run)",
+    )
+    detect.add_argument(
+        "--read-ball-stub",
+        action="store_true",
+        help="Load ball tracks from --ball-stub if length matches video frame count",
+    )
     detect.add_argument(
         "--output-folder",
         type=str,
@@ -180,6 +205,9 @@ def main():
             run_detection_pipeline(
                 source=args.source,
                 model_path=args.model,
+                ball_model_path=args.ball_model,
+                ball_read_stub=bool(args.read_ball_stub),
+                ball_stub_path=args.ball_stub,
                 output_path=legacy_video,
                 output_folder=out_folder,
                 log_events_all_frames=bool(args.log_events_all_frames),

@@ -2,9 +2,9 @@ import json
 import cv2
 import supervision as sv
 import numpy as np
-from .detector import Detector
+from .ball_tracker import BallTracker
+from .detector import Detector, _merge_detections
 from .visualize import Visualizer
-from .ball_deepsort import BallDeepOcSortTracker
 from .possession import PossessionAssigner
 
 from team_clustering.config import TeamClusteringConfig
@@ -22,6 +22,9 @@ class VideoProcessor:
         model_path: str,
         output_path: str = "output_tracked.mp4",
         *,
+        ball_model_path: str = "ball_detector_model.pt",
+        ball_read_stub: bool = False,
+        ball_stub_path: str | None = None,
         pass_detector=None,
         shot_detector=None,
         make_miss_detector=None,
@@ -30,11 +33,12 @@ class VideoProcessor:
         temporal_team_config: TemporalTeamConfig | None = None,
     ):
         self.detector = Detector(model_path)
+        self.ball_pipeline = BallTracker(ball_model_path)
+        self._ball_read_stub = bool(ball_read_stub)
+        self._ball_stub_path = ball_stub_path
         self.visualizer = Visualizer()
         self.output_path = output_path
         self.frame_tracking = FrameTrackingPipeline(tracking_config or TrackingConfig())
-        # DeepOcSort: Kalman bbox + ReID association (BoxMOT; closest to DeepSORT in this stack).
-        self.ball_tracker = BallDeepOcSortTracker()
         self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
         self._last_possessor_id = None
         # Per-frame delta of *tracked* ball center for event detectors (stable vs raw meas. pairs).
@@ -238,11 +242,20 @@ class VideoProcessor:
     def process_video(self, source: str):
         """
         Process the video frame-by-frame with tracking and visual Re-ID.
+
+        Ball: batched ``ball_detector_model.pt`` pass (filter + interpolate), then merged per frame.
         """
         video_info = sv.VideoInfo.from_video_path(source)
         video_fps = float(getattr(video_info, "fps", None) or 0.0)
         if video_fps <= 1e-6:
             video_fps = 30.0
+
+        ball_tracks = self.ball_pipeline.run_ball_pipeline_on_video(
+            source,
+            read_from_stub=self._ball_read_stub,
+            stub_path=self._ball_stub_path,
+        )
+
         frame_generator = sv.get_video_frames_generator(source)
 
         with sv.VideoSink(self.output_path, video_info, codec="mp4v") as sink:
@@ -250,8 +263,20 @@ class VideoProcessor:
             for frame in frame_generator:
                 frame_idx += 1
                 time_sec = (frame_idx - 1) / video_fps
-                # 1. Detection
+                # 1. Main detection (no ball)
                 detections = self.detector.get_detections(frame)
+
+                # 1b. Merge ball from BallTracker pipeline (highest-conf ``Ball`` + temporal cleanup)
+                ti = frame_idx - 1
+                if ti < len(ball_tracks):
+                    bb = ball_tracks[ti].get(1, {}).get("bbox", [])
+                    if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                        ball_det = sv.Detections(
+                            xyxy=np.asarray([bb], dtype=np.float32),
+                            confidence=np.array([0.99], dtype=np.float32),
+                            class_id=np.array([0], dtype=np.int32),
+                        )
+                        detections = _merge_detections(detections, ball_det)
 
                 # 2. ByteTrack + Re-ID (appearance / jersey / height) + optional Kalman (reusable module)
                 detections, _frame_track_result = self.frame_tracking.step(
@@ -300,7 +325,7 @@ class VideoProcessor:
                         detections = detections[final_mask]
                 # ---------------------------------
 
-                # 3. Ball track (DeepOcSort) + synthetic ball when needed
+                # 3. Ball center from merged ball row (BallTracker + interpolate); synthetic if missing
                 ball_mask = detections.class_id == 0
                 ball_center_xy = None
                 ball_source = "none"
@@ -308,54 +333,35 @@ class VideoProcessor:
                 if np.any(ball_mask):
                     ball_idx = int(np.where(ball_mask)[0][0])
                     b = detections.xyxy[ball_idx].astype(np.float32)
-                    conf = (
-                        float(detections.confidence[ball_idx])
-                        if detections.confidence is not None
-                        else 0.25
+                    ball_center_xy = (
+                        float((b[0] + b[2]) * 0.5),
+                        float((b[1] + b[3]) * 0.5),
                     )
-
-                    ball_center_xy, tracked_bb = self.ball_tracker.update(frame, b, conf)
-                    if ball_center_xy is None or tracked_bb is None:
-                        bc = ((b[0] + b[2]) * 0.5, (b[1] + b[3]) * 0.5)
-                        ball_center_xy = bc
-                        tracked_bb = b.copy()
-                        ball_source = "det_raw"
-                    else:
-                        detections.xyxy[ball_idx] = tracked_bb
-                        ball_source = "det"
-
+                    ball_source = "ball_pipeline"
                     try:
                         detections.tracker_id[ball_idx] = 0
                     except Exception:
                         pass
                 else:
-                    if not self.ball_tracker.initialized:
-                        h, w = frame.shape[:2]
-                        ball_center_xy = (float(w * 0.5), float(h * 0.5))
-                        ball_source = "init_center"
-                        bb = self.ball_tracker.center_to_bbox_xyxy(
-                            ball_center_xy, default_wh=(16.0, 16.0)
-                        )
-                        synth = sv.Detections(
-                            xyxy=np.array([bb], dtype=np.float32),
-                            confidence=np.array([0.01], dtype=np.float32),
-                            class_id=np.array([0], dtype=np.int32),
-                            tracker_id=np.array([0], dtype=np.int32),
-                        )
-                        detections = self._append_synthetic_detection(detections, synth)
-                    else:
-                        ball_center_xy, tracked_bb = self.ball_tracker.update(frame, None, 0.0)
-                        ball_source = "deepsort_kalman"
-
-                        if ball_center_xy is not None and tracked_bb is not None:
-                            bb = np.asarray(tracked_bb, dtype=np.float32)
-                            synth = sv.Detections(
-                                xyxy=np.array([bb], dtype=np.float32),
-                                confidence=np.array([0.01], dtype=np.float32),
-                                class_id=np.array([0], dtype=np.int32),
-                                tracker_id=np.array([0], dtype=np.int32),
-                            )
-                            detections = self._append_synthetic_detection(detections, synth)
+                    h, w = frame.shape[:2]
+                    ball_center_xy = (float(w * 0.5), float(h * 0.5))
+                    ball_source = "init_center"
+                    bb = np.array(
+                        [
+                            float(w * 0.5 - 8),
+                            float(h * 0.5 - 8),
+                            float(w * 0.5 + 8),
+                            float(h * 0.5 + 8),
+                        ],
+                        dtype=np.float32,
+                    )
+                    synth = sv.Detections(
+                        xyxy=np.array([bb], dtype=np.float32),
+                        confidence=np.array([0.01], dtype=np.float32),
+                        class_id=np.array([0], dtype=np.int32),
+                        tracker_id=np.array([0], dtype=np.int32),
+                    )
+                    detections = self._append_synthetic_detection(detections, synth)
 
                 if ball_center_xy is not None and ball_center_xy[0] is not None:
                     bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
