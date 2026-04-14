@@ -1,6 +1,6 @@
 """
 Reusable tracking stack: ByteTrack, multi-cue player Re-ID, optional Kalman smoothing.
-Ball path continues to use ``detection_pipeline.ball_deepsort.BallDeepOcSortTracker`` (DeepOcSort).
+Ball boxes come from ``detection_pipeline.ball_tracker.BallTracker`` (YOLO + temporal filter + interpolate).
 
 Typical service usage::
 
