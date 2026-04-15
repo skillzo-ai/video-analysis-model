@@ -1,11 +1,15 @@
 import json
+from pathlib import Path
+
 import cv2
-import supervision as sv
 import numpy as np
+import supervision as sv
+
 from .ball_tracker import BallTracker
 from .detector import Detector, _merge_detections
 from .visualize import Visualizer
 from .possession import PossessionAssigner
+from .yolo_export import detections_to_yolo_txt, write_classes_txt
 
 from team_clustering.config import TeamClusteringConfig
 from team_clustering.temporal_team_classification import TemporalTeamClassifier, TemporalTeamConfig
@@ -31,6 +35,8 @@ class VideoProcessor:
         log_events_all_frames: bool = False,
         tracking_config: TrackingConfig | None = None,
         temporal_team_config: TemporalTeamConfig | None = None,
+        export_dataset_dir: str | Path | None = None,
+        export_interval: int = 25,
     ):
         self.detector = Detector(model_path)
         self.ball_pipeline = BallTracker(ball_model_path)
@@ -55,6 +61,46 @@ class VideoProcessor:
             "Team A": {"passes": 0, "shots": 0, "makes": 0},
             "Team B": {"passes": 0, "shots": 0, "makes": 0},
         }
+
+        self._export_dataset_dir: Path | None = (
+            Path(export_dataset_dir).resolve() if export_dataset_dir else None
+        )
+        self._export_interval = max(1, int(export_interval))
+        self._export_dirs_ready = False
+
+    def _ensure_export_layout(self) -> tuple[Path, Path]:
+        """Create ``{export}/images`` and ``{export}/labels`` and write ``classes.txt`` once."""
+        assert self._export_dataset_dir is not None
+        base = self._export_dataset_dir
+        images_dir = base / "images"
+        labels_dir = base / "labels"
+        if not self._export_dirs_ready:
+            base.mkdir(parents=True, exist_ok=True)
+            images_dir.mkdir(parents=True, exist_ok=True)
+            labels_dir.mkdir(parents=True, exist_ok=True)
+            names = {int(k): str(v) for k, v in self.detector.main_model.names.items()}
+            write_classes_txt(names, base / "classes.txt")
+            self._export_dirs_ready = True
+        return images_dir, labels_dir
+
+    def _write_dataset_sample(
+        self,
+        frame_bgr: np.ndarray,
+        detections: sv.Detections,
+        frame_idx: int,
+    ) -> None:
+        """Save raw frame + YOLO labels from current detections (no synthetic ball yet)."""
+        if self._export_dataset_dir is None:
+            return
+        if (frame_idx - 1) % self._export_interval != 0:
+            return
+        images_dir, labels_dir = self._ensure_export_layout()
+        h, w = frame_bgr.shape[:2]
+        stem = f"frame_{frame_idx:06d}"
+        img_path = images_dir / f"{stem}.jpg"
+        lbl_path = labels_dir / f"{stem}.txt"
+        cv2.imwrite(str(img_path), frame_bgr)
+        lbl_path.write_text(detections_to_yolo_txt(detections, w, h), encoding="utf-8")
 
     @staticmethod
     def _append_synthetic_detection(base: sv.Detections, extra: sv.Detections) -> sv.Detections:
@@ -324,6 +370,9 @@ class VideoProcessor:
                                 final_mask[b_idx] = False
                         detections = detections[final_mask]
                 # ---------------------------------
+
+                # 2b. Dataset export (same pass — before synthetic ball placeholder)
+                self._write_dataset_sample(frame, detections, frame_idx)
 
                 # 3. Ball center from merged ball row (BallTracker + interpolate); synthetic if missing
                 ball_mask = detections.class_id == 0

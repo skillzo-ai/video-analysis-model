@@ -46,6 +46,15 @@ def run_detection_pipeline(
     log_events_all_frames: bool = False,
     tracking_config: TrackingConfig | dict | None = None,
     temporal_team_config: TemporalTeamConfig | dict | None = None,
+    roboflow_export: bool = False,
+    roboflow_upload: bool = False,
+    roboflow_interval: int = 25,
+    roboflow_out_dir: str | None = None,
+    roboflow_max_uploads: int | None = None,
+    roboflow_workspace: str = "kartiks-workspace-ia4hy",
+    roboflow_project: str = "basketball-players-arj24",
+    roboflow_split: str = "train",
+    roboflow_target_classes: str | None = None,
 ) -> dict[str, str]:
     """
     Run tracking on `source` and write:
@@ -56,6 +65,14 @@ def run_detection_pipeline(
     If only ``output_path`` is set (legacy), that path is used for the video and the JSON
     is written next to it as ``{input_stem}.json``.
     If neither is set, defaults to folder ``output`` under the current working directory.
+
+    If ``roboflow_export`` is True, during ``process_video`` the pipeline also writes raw frames and
+    YOLO ``.txt`` labels every ``roboflow_interval`` frames under ``{output}/{video_stem}/``.
+    If ``roboflow_upload`` is True, those files are uploaded from that folder after processing
+    (see ``Dataset.upload_annonations.upload_export_folder_to_roboflow`` — no second model pass).
+    For Roboflow projects with locked classes, pass ``roboflow_target_classes`` (or place
+    ``roboflow_target_classes.txt`` in the export folder) listing class names in Roboflow's order
+    so label indices are remapped by name from ``classes.txt``.
     """
     try:
         model_path = str(_resolve_existing_path(model_path))
@@ -103,6 +120,14 @@ def run_detection_pipeline(
         else temporal_team_config
     )
 
+    export_dir_for_processor: str | None = None
+    if roboflow_export:
+        export_dir_for_processor = (
+            str(Path(roboflow_out_dir).resolve())
+            if roboflow_out_dir
+            else str((video_out.parent / input_stem).resolve())
+        )
+
     processor = VideoProcessor(
         model_path=model_path,
         ball_model_path=ball_model_path,
@@ -115,6 +140,8 @@ def run_detection_pipeline(
         log_events_all_frames=log_events_all_frames,
         tracking_config=tc,
         temporal_team_config=tteam,
+        export_dataset_dir=export_dir_for_processor,
+        export_interval=roboflow_interval,
     )
     processor.process_video(source=source)
 
@@ -125,7 +152,37 @@ def run_detection_pipeline(
 
     print(f"Tracking complete. Video: {video_out}")
     print(f"Stats JSON: {json_out}")
-    return {"video": str(video_out), "stats_json": str(json_out)}
+
+    result: dict[str, str] = {"video": str(video_out), "stats_json": str(json_out)}
+
+    if roboflow_export and export_dir_for_processor:
+        print(
+            f"Dataset export (during tracking): every {roboflow_interval} frames → {export_dir_for_processor}"
+        )
+        result["roboflow_export_dir"] = export_dir_for_processor
+
+    if roboflow_export and roboflow_upload and export_dir_for_processor:
+        from Dataset.upload_annonations import upload_export_folder_to_roboflow
+
+        rtc_path: str | None = None
+        if roboflow_target_classes:
+            try:
+                rtc_path = str(_resolve_existing_path(roboflow_target_classes))
+            except FileNotFoundError as e:
+                raise FileNotFoundError(
+                    f"Roboflow target classes file not found: {roboflow_target_classes}"
+                ) from e
+
+        upload_export_folder_to_roboflow(
+            export_dir_for_processor,
+            workspace_id=roboflow_workspace,
+            project_id=roboflow_project,
+            upload_split=roboflow_split,
+            max_uploads=roboflow_max_uploads,
+            roboflow_target_classes=rtc_path,
+        )
+
+    return result
 
 
 def run_team_clustering_on_image(
@@ -211,6 +268,63 @@ def main():
         action="store_true",
         help="Print pass/shot/make JSON every frame (default: only when any event is True)",
     )
+    detect.add_argument(
+        "--no-roboflow",
+        action="store_true",
+        help="Skip Roboflow export/upload after tracking (default: export runs at the end)",
+    )
+    detect.add_argument(
+        "--roboflow-upload",
+        action="store_true",
+        help="After export, also upload each image+label to Roboflow (needs ROBOFLOW_API)",
+    )
+    detect.add_argument(
+        "--roboflow-interval",
+        type=int,
+        default=25,
+        help="Frame interval for Roboflow export (default: 25)",
+    )
+    detect.add_argument(
+        "--roboflow-out",
+        type=str,
+        default=None,
+        help="Export root folder named like the video (default: {output_folder}/{video_stem}/)",
+    )
+    detect.add_argument(
+        "--roboflow-max-uploads",
+        type=int,
+        default=None,
+        help="Stop Roboflow upload after this many images (testing)",
+    )
+    detect.add_argument(
+        "--roboflow-workspace",
+        type=str,
+        default="kartiks-workspace-ia4hy",
+        help="Roboflow workspace id for uploads",
+    )
+    detect.add_argument(
+        "--roboflow-project",
+        type=str,
+        default="basketball-players-arj24",
+        help="Roboflow project id for uploads",
+    )
+    detect.add_argument(
+        "--roboflow-split",
+        type=str,
+        default="train",
+        choices=("train", "valid", "test"),
+        help="Roboflow split for uploads",
+    )
+    detect.add_argument(
+        "--roboflow-target-classes",
+        type=str,
+        default=None,
+        help=(
+            "File: one Roboflow class name per line (project order). "
+            "Remaps local YOLO ids by name so locked-class uploads succeed. "
+            "Or put roboflow_target_classes.txt inside the export folder."
+        ),
+    )
 
     teams = sub.add_parser("teams", help="Run team clustering on a single image + bboxes JSON")
     teams.add_argument("--image", type=str, required=True, help="Path to input image (frame)")
@@ -236,6 +350,15 @@ def main():
                 output_path=legacy_video,
                 output_folder=out_folder,
                 log_events_all_frames=bool(args.log_events_all_frames),
+                roboflow_export=not bool(args.no_roboflow),
+                roboflow_upload=bool(args.roboflow_upload),
+                roboflow_interval=int(args.roboflow_interval),
+                roboflow_out_dir=args.roboflow_out,
+                roboflow_max_uploads=args.roboflow_max_uploads,
+                roboflow_workspace=args.roboflow_workspace,
+                roboflow_project=args.roboflow_project,
+                roboflow_split=args.roboflow_split,
+                roboflow_target_classes=args.roboflow_target_classes,
             )
         elif args.command == "teams":
             run_team_clustering_on_image(args.image, args.bboxes, args.output, debug=bool(args.debug))

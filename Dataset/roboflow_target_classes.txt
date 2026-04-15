@@ -1,0 +1,7 @@
+0 → Ball
+1 → Clock
+2 → Hoop
+3 → Overlay
+4 → Player
+5 → Ref
+6 → Scoreboard

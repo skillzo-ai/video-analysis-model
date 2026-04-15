@@ -1,0 +1,11 @@
+# Copy this file to roboflow_target_classes.txt (next to your export images/labels)
+# or pass --roboflow-target-classes to main / upload_annonations.
+#
+# List class names ONE PER LINE in the exact same order as your Roboflow project:
+# Roboflow → your project → Dataset → Classes (order matters for YOLO class ids 0,1,2,...).
+#
+# Names are matched case-insensitively to your exported classes.txt from the local model.
+
+Ball
+Hoop
+Player
