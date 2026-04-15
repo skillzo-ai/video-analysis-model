@@ -12,7 +12,10 @@ from .possession import PossessionAssigner
 from .yolo_export import detections_to_yolo_txt, write_classes_txt
 
 from team_clustering.config import TeamClusteringConfig
-from team_clustering.temporal_team_classification import TemporalTeamClassifier, TemporalTeamConfig
+from team_clustering.temporal_team_classification import (
+    TemporalTeamClassifier,
+    TemporalTeamConfig,
+)
 from team_clustering.visualization import draw_player_ellipse
 
 from core.tracking import assign_ball_owner
@@ -45,7 +48,9 @@ class VideoProcessor:
         self.visualizer = Visualizer()
         self.output_path = output_path
         self.frame_tracking = FrameTrackingPipeline(tracking_config or TrackingConfig())
-        self.possession = PossessionAssigner(max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10)
+        self.possession = PossessionAssigner(
+            max_dist_px=140.0, switch_confirm_frames=3, keep_frames_when_lost=10
+        )
         self._last_possessor_id = None
         # Per-frame delta of *tracked* ball center for event detectors (stable vs raw meas. pairs).
         self._prev_ball_center_events: tuple[float, float] | None = None
@@ -56,7 +61,9 @@ class VideoProcessor:
         self.log_events_all_frames = bool(log_events_all_frames)
 
         # Two-team classification: HSV KMeans + temporal majority vote (see temporal_team_classification).
-        self.team_classifier = TemporalTeamClassifier(temporal_team_config or TemporalTeamConfig())
+        self.team_classifier = TemporalTeamClassifier(
+            temporal_team_config or TemporalTeamConfig()
+        )
         self._team_stats = {
             "Team A": {"passes": 0, "shots": 0, "makes": 0},
             "Team B": {"passes": 0, "shots": 0, "makes": 0},
@@ -103,7 +110,9 @@ class VideoProcessor:
         lbl_path.write_text(detections_to_yolo_txt(detections, w, h), encoding="utf-8")
 
     @staticmethod
-    def _append_synthetic_detection(base: sv.Detections, extra: sv.Detections) -> sv.Detections:
+    def _append_synthetic_detection(
+        base: sv.Detections, extra: sv.Detections
+    ) -> sv.Detections:
         """
         supervision.Detections.merge() requires matching data keys; this append pads base.data keys.
         Assumes `extra` contains exactly one row.
@@ -116,25 +125,52 @@ class VideoProcessor:
 
         confidence = None
         if base.confidence is not None or extra.confidence is not None:
-            b = base.confidence if base.confidence is not None else np.zeros((len(base),), dtype=np.float32)
-            e = extra.confidence if extra.confidence is not None else np.zeros((len(extra),), dtype=b.dtype)
+            b = (
+                base.confidence
+                if base.confidence is not None
+                else np.zeros((len(base),), dtype=np.float32)
+            )
+            e = (
+                extra.confidence
+                if extra.confidence is not None
+                else np.zeros((len(extra),), dtype=b.dtype)
+            )
             confidence = np.concatenate([b, e], axis=0)
 
         class_id = None
         if base.class_id is not None or extra.class_id is not None:
-            b = base.class_id if base.class_id is not None else np.zeros((len(base),), dtype=np.int32)
-            e = extra.class_id if extra.class_id is not None else np.zeros((len(extra),), dtype=b.dtype)
+            b = (
+                base.class_id
+                if base.class_id is not None
+                else np.zeros((len(base),), dtype=np.int32)
+            )
+            e = (
+                extra.class_id
+                if extra.class_id is not None
+                else np.zeros((len(extra),), dtype=b.dtype)
+            )
             class_id = np.concatenate([b, e], axis=0)
 
         tracker_id = None
         if base.tracker_id is not None or extra.tracker_id is not None:
-            b = base.tracker_id if base.tracker_id is not None else np.full((len(base),), -1, dtype=np.int32)
-            e = extra.tracker_id if extra.tracker_id is not None else np.full((len(extra),), -1, dtype=b.dtype)
+            b = (
+                base.tracker_id
+                if base.tracker_id is not None
+                else np.full((len(base),), -1, dtype=np.int32)
+            )
+            e = (
+                extra.tracker_id
+                if extra.tracker_id is not None
+                else np.full((len(extra),), -1, dtype=b.dtype)
+            )
             tracker_id = np.concatenate([b, e], axis=0)
 
         # Optional masks
         mask = None
-        if getattr(base, "mask", None) is not None or getattr(extra, "mask", None) is not None:
+        if (
+            getattr(base, "mask", None) is not None
+            or getattr(extra, "mask", None) is not None
+        ):
             b = base.mask if getattr(base, "mask", None) is not None else None
             e = extra.mask if getattr(extra, "mask", None) is not None else None
             if b is not None and e is not None:
@@ -229,7 +265,9 @@ class VideoProcessor:
         margin = 10
         pad = 6
 
-        def lines_for(team_name: str, st: dict[str, int]) -> list[tuple[str, tuple[int, int, int]]]:
+        def lines_for(
+            team_name: str, st: dict[str, int]
+        ) -> list[tuple[str, tuple[int, int, int]]]:
             hdr_color = color_a if team_name == "Team A" else color_b
             return [
                 (team_name, hdr_color),
@@ -241,7 +279,9 @@ class VideoProcessor:
         block_a = lines_for("Team A", stats_a)
         block_b = lines_for("Team B", stats_b)
         gap_lines = 1
-        all_rows: list[tuple[str, tuple[int, int, int]]] = block_a + [("", (0, 0, 0))] * gap_lines + block_b
+        all_rows: list[tuple[str, tuple[int, int, int]]] = (
+            block_a + [("", (0, 0, 0))] * gap_lines + block_b
+        )
 
         max_tw = 0
         for text, _ in all_rows:
@@ -333,27 +373,37 @@ class VideoProcessor:
                 # If there are multiple balls, keep only the one nearest to the highest-confidence player
                 ball_mask = detections.class_id == 0
                 player_mask = detections.class_id == 4
-                
+
                 if np.sum(ball_mask) > 1:
                     if np.sum(player_mask) > 0:
                         # Find player with highest confidence
                         player_idx = np.argmax(detections.confidence[player_mask])
                         player_bbox = detections.xyxy[player_mask][player_idx]
-                        player_center = np.array([(player_bbox[0] + player_bbox[2]) / 2, (player_bbox[1] + player_bbox[3]) / 2])
-                        
+                        player_center = np.array(
+                            [
+                                (player_bbox[0] + player_bbox[2]) / 2,
+                                (player_bbox[1] + player_bbox[3]) / 2,
+                            ]
+                        )
+
                         # Find nearest ball
                         ball_indices = np.where(ball_mask)[0]
-                        min_dist = float('inf')
+                        min_dist = float("inf")
                         best_ball_idx = ball_indices[0]
-                        
+
                         for b_idx in ball_indices:
                             ball_bbox = detections.xyxy[b_idx]
-                            ball_center = np.array([(ball_bbox[0] + ball_bbox[2]) / 2, (ball_bbox[1] + ball_bbox[3]) / 2])
+                            ball_center = np.array(
+                                [
+                                    (ball_bbox[0] + ball_bbox[2]) / 2,
+                                    (ball_bbox[1] + ball_bbox[3]) / 2,
+                                ]
+                            )
                             dist = np.linalg.norm(player_center - ball_center)
                             if dist < min_dist:
                                 min_dist = dist
                                 best_ball_idx = b_idx
-                        
+
                         # Filter out other balls
                         final_mask = np.ones(len(detections), dtype=bool)
                         for b_idx in ball_indices:
@@ -363,7 +413,9 @@ class VideoProcessor:
                     else:
                         # No players? Keep only highest confidence ball
                         ball_indices = np.where(ball_mask)[0]
-                        best_ball_idx = ball_indices[np.argmax(detections.confidence[ball_mask])]
+                        best_ball_idx = ball_indices[
+                            np.argmax(detections.confidence[ball_mask])
+                        ]
                         final_mask = np.ones(len(detections), dtype=bool)
                         for b_idx in ball_indices:
                             if b_idx != best_ball_idx:
@@ -414,8 +466,7 @@ class VideoProcessor:
 
                 if ball_center_xy is not None and ball_center_xy[0] is not None:
                     bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
-                   
-                
+
                 # 3.6 Possession assignment (nearest player to ball)
                 player_mask = detections.class_id == 4
                 possessor_id = None
@@ -456,7 +507,9 @@ class VideoProcessor:
                             cx = (float(bb[0]) + float(bb[2])) * 0.5
                             cy = (float(bb[1]) + float(bb[3])) * 0.5
                             pid = int(detections.tracker_id[int(j)])
-                            player_states.append(PlayerState(player_id=pid, position=(cx, cy)))
+                            player_states.append(
+                                PlayerState(player_id=pid, position=(cx, cy))
+                            )
 
                     centers = [p.position for p in player_states]
                     pids = [p.player_id for p in player_states]
@@ -492,11 +545,12 @@ class VideoProcessor:
                         "shot": bool(shot_evt),
                         "make": bool(make_evt),
                     }
-                    
 
                     if pass_evt and self.pass_detector.last_pass_from_id is not None:
                         tid_pass = int(self.pass_detector.last_pass_from_id)
-                        self._bump_team_stat(self._team_label_for_player(tid_pass), "passes")
+                        self._bump_team_stat(
+                            self._team_label_for_player(tid_pass), "passes"
+                        )
                     if shot_evt and owner_for_events is not None:
                         self._bump_team_stat(
                             self._team_label_for_player(int(owner_for_events)), "shots"
@@ -512,17 +566,17 @@ class VideoProcessor:
                 # 4. Label preparation
                 # Keep the video overlay clean: no per-track text labels in the final render.
                 labels = None
-                
+
                 # 5. Visualization (ball/hoop via supervision; players drawn with team colors)
                 annotated_frame = self.visualizer.draw_detections(
-                    frame=frame, 
-                    detections=detections, 
-                    labels=labels
+                    frame=frame, detections=detections, labels=labels
                 )
 
                 # 5.1 Robust two-team classification (HSV KMeans + temporal majority) + foot ellipses (legacy style)
                 player_mask = detections.class_id == 4
-                possessor_id_int = int(possessor_id) if possessor_id is not None else None
+                possessor_id_int = (
+                    int(possessor_id) if possessor_id is not None else None
+                )
                 tcfg = self.team_classifier.cfg
                 ellipse_cfg = TeamClusteringConfig(
                     debug=False,

@@ -47,14 +47,8 @@ def run_detection_pipeline(
     tracking_config: TrackingConfig | dict | None = None,
     temporal_team_config: TemporalTeamConfig | dict | None = None,
     roboflow_export: bool = False,
-    roboflow_upload: bool = False,
     roboflow_interval: int = 25,
     roboflow_out_dir: str | None = None,
-    roboflow_max_uploads: int | None = None,
-    roboflow_workspace: str = "kartiks-workspace-ia4hy",
-    roboflow_project: str = "basketball-players-arj24",
-    roboflow_split: str = "train",
-    roboflow_target_classes: str | None = None,
 ) -> dict[str, str]:
     """
     Run tracking on `source` and write:
@@ -68,11 +62,8 @@ def run_detection_pipeline(
 
     If ``roboflow_export`` is True, during ``process_video`` the pipeline also writes raw frames and
     YOLO ``.txt`` labels every ``roboflow_interval`` frames under ``{output}/{video_stem}/``.
-    If ``roboflow_upload`` is True, those files are uploaded from that folder after processing
-    (see ``Dataset.upload_annonations.upload_export_folder_to_roboflow`` — no second model pass).
-    For Roboflow projects with locked classes, pass ``roboflow_target_classes`` (or place
-    ``roboflow_target_classes.txt`` in the export folder) listing class names in Roboflow's order
-    so label indices are remapped by name from ``classes.txt``.
+    Upload those to Roboflow separately: ``python upload_to_roboflow.py --export-dir <that folder>``
+    (or use ``--roboflow-upload`` on the ``detect`` CLI, which runs that step after tracking).
     """
     try:
         model_path = str(_resolve_existing_path(model_path))
@@ -150,37 +141,13 @@ def run_detection_pipeline(
     with open(json_out, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
-    # print(f"Tracking complete. Video: {video_out}")
-    # print(f"Stats JSON: {json_out}")
+    print(f"Tracking complete. Video: {video_out}")
+    print(f"Stats JSON: {json_out}")
 
     result: dict[str, str] = {"video": str(video_out), "stats_json": str(json_out)}
 
     if roboflow_export and export_dir_for_processor:
-        # print(
-        #     f"Dataset export (during tracking): every {roboflow_interval} frames → {export_dir_for_processor}"
-        # )
         result["roboflow_export_dir"] = export_dir_for_processor
-
-    if roboflow_export and roboflow_upload and export_dir_for_processor:
-        from Dataset.upload_annonations import upload_export_folder_to_roboflow
-
-        rtc_path: str | None = None
-        if roboflow_target_classes:
-            try:
-                rtc_path = str(_resolve_existing_path(roboflow_target_classes))
-            except FileNotFoundError as e:
-                raise FileNotFoundError(
-                    f"Roboflow target classes file not found: {roboflow_target_classes}"
-                ) from e
-
-        upload_export_folder_to_roboflow(
-            export_dir_for_processor,
-            workspace_id=roboflow_workspace,
-            project_id=roboflow_project,
-            upload_split=roboflow_split,
-            max_uploads=roboflow_max_uploads,
-            roboflow_target_classes=rtc_path,
-        )
 
     return result
 
@@ -276,7 +243,7 @@ def main():
     detect.add_argument(
         "--roboflow-upload",
         action="store_true",
-        help="After export, also upload each image+label to Roboflow (needs ROBOFLOW_API)",
+        help="After detection, run upload_to_roboflow.py on the export folder (needs ROBOFLOW_API)",
     )
     detect.add_argument(
         "--roboflow-interval",
@@ -341,7 +308,7 @@ def main():
                 out_folder = "output"
             # If --output-folder is set, it controls both files; --output is ignored.
             legacy_video = args.output if args.output_folder is None else None
-            run_detection_pipeline(
+            detect_result = run_detection_pipeline(
                 source=args.source,
                 model_path=args.model,
                 ball_model_path=args.ball_model,
@@ -351,15 +318,20 @@ def main():
                 output_folder=out_folder,
                 log_events_all_frames=bool(args.log_events_all_frames),
                 roboflow_export=not bool(args.no_roboflow),
-                roboflow_upload=bool(args.roboflow_upload),
                 roboflow_interval=int(args.roboflow_interval),
                 roboflow_out_dir=args.roboflow_out,
-                roboflow_max_uploads=args.roboflow_max_uploads,
-                roboflow_workspace=args.roboflow_workspace,
-                roboflow_project=args.roboflow_project,
-                roboflow_split=args.roboflow_split,
-                roboflow_target_classes=args.roboflow_target_classes,
             )
+            if args.roboflow_upload and detect_result.get("roboflow_export_dir"):
+                from upload_to_roboflow import run_roboflow_upload
+
+                run_roboflow_upload(
+                    detect_result["roboflow_export_dir"],
+                    workspace_id=args.roboflow_workspace,
+                    project_id=args.roboflow_project,
+                    upload_split=args.roboflow_split,
+                    max_uploads=args.roboflow_max_uploads,
+                    roboflow_target_classes=args.roboflow_target_classes,
+                )
         elif args.command == "teams":
             run_team_clustering_on_image(args.image, args.bboxes, args.output, debug=bool(args.debug))
         else:
