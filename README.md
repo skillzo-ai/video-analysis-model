@@ -16,7 +16,7 @@ The **Skillzo Video Analysis** engine is the intelligence core of the platform. 
 
 ## 🛠️ Stack & Dependencies
 
-- **Framework**: Ultralytics YOLOv11
+- **Framework**: Ultralytics YOLOv8
 - **Deep Learning**: PyTorch
 - **Tracking**: Supervision, ByteTrack
 - **Image Processing**: OpenCV

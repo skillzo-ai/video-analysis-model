@@ -16,5 +16,8 @@ data
 *.pt
 *.onnx
 *.mp4
+*.png
+*.jpg
+
 output/
 temp.py

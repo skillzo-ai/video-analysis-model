@@ -462,7 +462,7 @@ class VideoProcessor:
                     self._prev_ball_center_events = None
 
                 # 4. Label preparation
-                # We'll draw colored labels ourselves after team assignment.
+                # Keep the video overlay clean: no per-track text labels in the final render.
                 labels = None
                 
                 # 5. Visualization (ball/hoop via supervision; players drawn with team colors)
@@ -514,90 +514,7 @@ class VideoProcessor:
                             player_id=None,
                         )
 
-                    for bb_xyxy, tid in zip(player_xyxy.astype(int).tolist(), player_ids.tolist()):
-                        x1, y1, x2, y2 = (
-                            int(bb_xyxy[0]),
-                            int(bb_xyxy[1]),
-                            int(bb_xyxy[2]),
-                            int(bb_xyxy[3]),
-                        )
-                        team_smoothed = self.team_classifier.get_team(int(tid))
-                        if possessor_id_int is not None and int(tid) == possessor_id_int:
-                            color = ellipse_cfg.possession_highlight_bgr
-                        else:
-                            color = (
-                                ellipse_cfg.ellipse_color_team_a_bgr
-                                if team_smoothed == "Team A"
-                                else ellipse_cfg.ellipse_color_team_b_bgr
-                            )
-                        text = f"Player #{int(tid)}"
-                        cv2.putText(
-                            annotated_frame,
-                            text,
-                            (x1, max(0, y1 - 6)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            float(ellipse_cfg.text_scale),
-                            color,
-                            int(ellipse_cfg.text_thickness),
-                            cv2.LINE_AA,
-                        )
-
-                # Draw labels for non-player detections (ball/hoop) in a neutral color
-                neutral = (255, 255, 255)
-                for bb, cls, tid in zip(detections.xyxy.astype(int), detections.class_id, detections.tracker_id):
-                    if int(cls) == 4:
-                        continue
-                    x1, y1, x2, y2 = (int(bb[0]), int(bb[1]), int(bb[2]), int(bb[3]))
-                    class_name = {0: "Ball", 2: "Hoop"}.get(int(cls), "Obj")
-                    text = f"{class_name} #{int(tid)}"
-                    cv2.putText(
-                        annotated_frame,
-                        text,
-                        (x1, max(0, y1 - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        neutral,
-                        1,
-                        cv2.LINE_AA,
-                    )
-
-                # Top overlay: who has the ball
-                if possessor_id is not None:
-                    text = f"Player {int(possessor_id)} has ball"
-                else:
-                    text = "No possession"
-
-                
-               
-               
                 self._last_possessor_id = possessor_id
-
-                cv2.putText(
-                    annotated_frame,
-                    text,
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1.0,
-                    (0, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-                cal_dur = float(self.team_classifier.cfg.calibration_duration_sec)
-                if cal_dur > 0 and self.team_classifier.is_in_calibration_window(time_sec):
-                    cal_txt = (
-                        f"Team calibration: {time_sec:.1f}s / {cal_dur:.0f}s (majority, then fixed)"
-                    )
-                    cv2.putText(
-                        annotated_frame,
-                        cal_txt,
-                        (20, 78),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (200, 200, 200),
-                        1,
-                        cv2.LINE_AA,
-                    )
 
                 self._draw_team_stats_panel(
                     annotated_frame,

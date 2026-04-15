@@ -14,6 +14,26 @@ from team_clustering.pipeline import classify_teams
 from team_clustering.temporal_team_classification import TemporalTeamConfig
 from tracking import TrackingConfig
 
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_existing_path(path_str: str, *, base_dir: Path = BASE_DIR) -> Path:
+    """
+    Resolve a path from the current working directory first, then relative to this
+    package's directory so model files can be found no matter where the process starts.
+    """
+    candidate = Path(path_str)
+    if candidate.exists():
+        return candidate.resolve()
+
+    fallback = (base_dir / candidate).resolve()
+    if fallback.exists():
+        return fallback
+
+    raise FileNotFoundError(path_str)
+
+
 def run_detection_pipeline(
     source: str,
     model_path: str = "best.pt",
@@ -37,9 +57,14 @@ def run_detection_pipeline(
     is written next to it as ``{input_stem}.json``.
     If neither is set, defaults to folder ``output`` under the current working directory.
     """
-    if not os.path.exists(model_path):
+    try:
+        model_path = str(_resolve_existing_path(model_path))
+    except FileNotFoundError:
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    if not os.path.exists(ball_model_path):
+
+    try:
+        ball_model_path = str(_resolve_existing_path(ball_model_path))
+    except FileNotFoundError:
         raise FileNotFoundError(f"Ball model file not found: {ball_model_path}")
 
     if not os.path.exists(source):
