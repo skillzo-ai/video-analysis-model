@@ -150,15 +150,15 @@ def run_detection_pipeline(
     with open(json_out, "w", encoding="utf-8") as f:
         json.dump(stats, f, indent=2)
 
-    print(f"Tracking complete. Video: {video_out}")
-    print(f"Stats JSON: {json_out}")
+    # print(f"Tracking complete. Video: {video_out}")
+    # print(f"Stats JSON: {json_out}")
 
     result: dict[str, str] = {"video": str(video_out), "stats_json": str(json_out)}
 
     if roboflow_export and export_dir_for_processor:
-        print(
-            f"Dataset export (during tracking): every {roboflow_interval} frames → {export_dir_for_processor}"
-        )
+        # print(
+        #     f"Dataset export (during tracking): every {roboflow_interval} frames → {export_dir_for_processor}"
+        # )
         result["roboflow_export_dir"] = export_dir_for_processor
 
     if roboflow_export and roboflow_upload and export_dir_for_processor:
@@ -221,10 +221,10 @@ def run_team_clustering_on_image(
     if not ok:
         raise ValueError(f"Failed to write output image: {output_path}")
 
-    print("labels:", result["labels"])
-    print("teams:", result["teams"])
-    print("cluster_centers:", result["cluster_centers"])
-    print("saved:", str(out_path))
+    # print("labels:", result["labels"])
+    # print("teams:", result["teams"])
+    # print("cluster_centers:", result["cluster_centers"])
+    # print("saved:", str(out_path))
     return str(out_path)
 
 def main():

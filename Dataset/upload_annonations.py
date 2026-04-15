@@ -91,6 +91,33 @@ def yolo_labelmap_dict(class_names: list[str]) -> dict[int, str]:
     return {i: class_names[i] for i in range(len(class_names))}
 
 
+def get_roboflow_project(
+    api_key: str,
+    workspace_id: str,
+    project_id: str,
+):
+    """Single ``Roboflow`` → workspace → project (reuse for batch uploads)."""
+    rf = Roboflow(api_key=api_key)
+    return rf.workspace(workspace_id).project(project_id)
+
+
+def upload_with_project(
+    project,
+    *,
+    image_path: str | Path,
+    annotation_path: str | Path,
+    split: str = "train",
+    annotation_labelmap: dict[int, str] | None = None,
+) -> None:
+    """Upload one image + label using an already-resolved ``project`` (no extra API client setup)."""
+    project.upload(
+        image_path=str(image_path),
+        annotation_path=str(annotation_path),
+        split=split,
+        annotation_labelmap=annotation_labelmap,
+    )
+
+
 def upload_annotation(
     *,
     api_key: str,
@@ -101,11 +128,12 @@ def upload_annotation(
     split: str = "train",
     annotation_labelmap: dict[int, str] | None = None,
 ) -> None:
-    rf = Roboflow(api_key=api_key)
-    project = rf.workspace(workspace_id).project(project_id)
-    project.upload(
-        image_path=str(image_path),
-        annotation_path=str(annotation_path),
+    """One-shot upload (constructs client once). Prefer :func:`get_roboflow_project` + :func:`upload_with_project` in a loop."""
+    project = get_roboflow_project(api_key, workspace_id, project_id)
+    upload_with_project(
+        project,
+        image_path=image_path,
+        annotation_path=annotation_path,
         split=split,
         annotation_labelmap=annotation_labelmap,
     )
@@ -194,6 +222,11 @@ def upload_export_folder_to_roboflow(
     if not jpgs:
         jpgs = sorted(images_dir.glob("*.png"))
 
+    if not jpgs:
+        print(f"No images under {images_dir}; nothing to upload.")
+        return 0
+
+    project = get_roboflow_project(api_key, workspace_id, project_id)
     count = 0
     for img_path in jpgs:
         if max_uploads is not None and count >= max_uploads:
@@ -230,10 +263,8 @@ def upload_export_folder_to_roboflow(
                 raise
 
         try:
-            upload_annotation(
-                api_key=api_key,
-                workspace_id=workspace_id,
-                project_id=project_id,
+            upload_with_project(
+                project,
                 image_path=img_path,
                 annotation_path=upload_path,
                 split=upload_split,
