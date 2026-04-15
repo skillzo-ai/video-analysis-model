@@ -492,8 +492,7 @@ class VideoProcessor:
                         "shot": bool(shot_evt),
                         "make": bool(make_evt),
                     }
-                    if self.log_events_all_frames or pass_evt or shot_evt or make_evt:
-                        print(json.dumps(payload))
+                    
 
                     if pass_evt and self.pass_detector.last_pass_from_id is not None:
                         tid_pass = int(self.pass_detector.last_pass_from_id)
