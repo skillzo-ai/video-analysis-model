@@ -102,3 +102,44 @@ class Detector:
             det_main = det_main[hi_ok]
 
         return det_main
+
+    def get_detections_batch(
+        self,
+        frames: list[np.ndarray],
+        conf: float = 0.15,
+        iou: float = 0.5,
+        player_conf: float = 0.3,
+    ) -> list[sv.Detections]:
+        """
+        Batch inference main model: hoop + player (no ball). Stricter conf for players/hoops.
+        """
+        if not frames:
+            return []
+            
+        main_results = self.main_model(
+            frames,
+            conf=conf,
+            iou=iou,
+            imgsz=832,
+            verbose=False,
+            classes=self.keep_classes_non_ball,
+        )
+        
+        batch_detections = []
+        for res in main_results:
+            det_main = sv.Detections.from_ultralytics(res)
+            if len(det_main) == 0:
+                batch_detections.append(det_main)
+                continue
+                
+            keep_mask = np.isin(det_main.class_id, self.keep_classes_non_ball)
+            det_main = det_main[keep_mask]
+            
+            if det_main.confidence is not None:
+                is_player_or_hoop = np.isin(det_main.class_id, self.player_hoop_classes)
+                hi_ok = (~is_player_or_hoop) | (det_main.confidence >= float(player_conf))
+                det_main = det_main[hi_ok]
+                
+            batch_detections.append(det_main)
+            
+        return batch_detections

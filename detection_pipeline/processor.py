@@ -344,290 +344,300 @@ class VideoProcessor:
 
         frame_generator = sv.get_video_frames_generator(source)
 
+        def batched(iterable, n):
+            batch = []
+            for item in iterable:
+                batch.append(item)
+                if len(batch) == n:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+
         with sv.VideoSink(self.output_path, video_info, codec="mp4v") as sink:
             frame_idx = 0
-            for frame in frame_generator:
-                frame_idx += 1
-                time_sec = (frame_idx - 1) / video_fps
-                # 1. Main detection (no ball)
-                detections = self.detector.get_detections(frame)
+            for frames_batch in batched(frame_generator, 8):
+                detections_batch = self.detector.get_detections_batch(frames_batch)
+                for frame, detections in zip(frames_batch, detections_batch):
+                    frame_idx += 1
+                    time_sec = (frame_idx - 1) / video_fps
 
-                # 1b. Merge ball from BallTracker pipeline (highest-conf ``Ball`` + temporal cleanup)
-                ti = frame_idx - 1
-                if ti < len(ball_tracks):
-                    bb = ball_tracks[ti].get(1, {}).get("bbox", [])
-                    if isinstance(bb, (list, tuple)) and len(bb) == 4:
-                        ball_det = sv.Detections(
-                            xyxy=np.asarray([bb], dtype=np.float32),
-                            confidence=np.array([0.99], dtype=np.float32),
-                            class_id=np.array([0], dtype=np.int32),
-                        )
-                        detections = _merge_detections(detections, ball_det)
+                    # 1b. Merge ball from BallTracker pipeline (highest-conf ``Ball`` + temporal cleanup)
+                    ti = frame_idx - 1
+                    if ti < len(ball_tracks):
+                        bb = ball_tracks[ti].get(1, {}).get("bbox", [])
+                        if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                            ball_det = sv.Detections(
+                                xyxy=np.asarray([bb], dtype=np.float32),
+                                confidence=np.array([0.99], dtype=np.float32),
+                                class_id=np.array([0], dtype=np.int32),
+                            )
+                            detections = _merge_detections(detections, ball_det)
 
-                # 2. ByteTrack + Re-ID (appearance / jersey / height) + optional Kalman (reusable module)
-                detections, _frame_track_result = self.frame_tracking.step(
-                    frame, detections, frame_index=frame_idx
-                )
+                    # 2. ByteTrack + Re-ID (appearance / jersey / height) + optional Kalman (reusable module)
+                    detections, _frame_track_result = self.frame_tracking.step(
+                        frame, detections, frame_index=frame_idx
+                    )
 
-                # --- NEW: Ball Filtering Logic ---
-                # If there are multiple balls, keep only the one nearest to the highest-confidence player
-                ball_mask = detections.class_id == 0
-                player_mask = detections.class_id == 4
+                    # --- NEW: Ball Filtering Logic ---
+                    # If there are multiple balls, keep only the one nearest to the highest-confidence player
+                    ball_mask = detections.class_id == 0
+                    player_mask = detections.class_id == 4
 
-                if np.sum(ball_mask) > 1:
-                    if np.sum(player_mask) > 0:
-                        # Find player with highest confidence
-                        player_idx = np.argmax(detections.confidence[player_mask])
-                        player_bbox = detections.xyxy[player_mask][player_idx]
-                        player_center = np.array(
-                            [
-                                (player_bbox[0] + player_bbox[2]) / 2,
-                                (player_bbox[1] + player_bbox[3]) / 2,
-                            ]
-                        )
-
-                        # Find nearest ball
-                        ball_indices = np.where(ball_mask)[0]
-                        min_dist = float("inf")
-                        best_ball_idx = ball_indices[0]
-
-                        for b_idx in ball_indices:
-                            ball_bbox = detections.xyxy[b_idx]
-                            ball_center = np.array(
+                    if np.sum(ball_mask) > 1:
+                        if np.sum(player_mask) > 0:
+                            # Find player with highest confidence
+                            player_idx = np.argmax(detections.confidence[player_mask])
+                            player_bbox = detections.xyxy[player_mask][player_idx]
+                            player_center = np.array(
                                 [
-                                    (ball_bbox[0] + ball_bbox[2]) / 2,
-                                    (ball_bbox[1] + ball_bbox[3]) / 2,
+                                    (player_bbox[0] + player_bbox[2]) / 2,
+                                    (player_bbox[1] + player_bbox[3]) / 2,
                                 ]
                             )
-                            dist = np.linalg.norm(player_center - ball_center)
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_ball_idx = b_idx
 
-                        # Filter out other balls
-                        final_mask = np.ones(len(detections), dtype=bool)
-                        for b_idx in ball_indices:
-                            if b_idx != best_ball_idx:
-                                final_mask[b_idx] = False
-                        detections = detections[final_mask]
+                            # Find nearest ball
+                            ball_indices = np.where(ball_mask)[0]
+                            min_dist = float("inf")
+                            best_ball_idx = ball_indices[0]
+
+                            for b_idx in ball_indices:
+                                ball_bbox = detections.xyxy[b_idx]
+                                ball_center = np.array(
+                                    [
+                                        (ball_bbox[0] + ball_bbox[2]) / 2,
+                                        (ball_bbox[1] + ball_bbox[3]) / 2,
+                                    ]
+                                )
+                                dist = np.linalg.norm(player_center - ball_center)
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_ball_idx = b_idx
+
+                            # Filter out other balls
+                            final_mask = np.ones(len(detections), dtype=bool)
+                            for b_idx in ball_indices:
+                                if b_idx != best_ball_idx:
+                                    final_mask[b_idx] = False
+                            detections = detections[final_mask]
+                        else:
+                            # No players? Keep only highest confidence ball
+                            ball_indices = np.where(ball_mask)[0]
+                            best_ball_idx = ball_indices[
+                                np.argmax(detections.confidence[ball_mask])
+                            ]
+                            final_mask = np.ones(len(detections), dtype=bool)
+                            for b_idx in ball_indices:
+                                if b_idx != best_ball_idx:
+                                    final_mask[b_idx] = False
+                            detections = detections[final_mask]
+                    # ---------------------------------
+
+                    # 2b. Dataset export (same pass — before synthetic ball placeholder)
+                    self._write_dataset_sample(frame, detections, frame_idx)
+
+                    # 3. Ball center from merged ball row (BallTracker + interpolate); synthetic if missing
+                    ball_mask = detections.class_id == 0
+                    ball_center_xy = None
+                    ball_source = "none"
+
+                    if np.any(ball_mask):
+                        ball_idx = int(np.where(ball_mask)[0][0])
+                        b = detections.xyxy[ball_idx].astype(np.float32)
+                        ball_center_xy = (
+                            float((b[0] + b[2]) * 0.5),
+                            float((b[1] + b[3]) * 0.5),
+                        )
+                        ball_source = "ball_pipeline"
+                        try:
+                            detections.tracker_id[ball_idx] = 0
+                        except Exception:
+                            pass
                     else:
-                        # No players? Keep only highest confidence ball
-                        ball_indices = np.where(ball_mask)[0]
-                        best_ball_idx = ball_indices[
-                            np.argmax(detections.confidence[ball_mask])
-                        ]
-                        final_mask = np.ones(len(detections), dtype=bool)
-                        for b_idx in ball_indices:
-                            if b_idx != best_ball_idx:
-                                final_mask[b_idx] = False
-                        detections = detections[final_mask]
-                # ---------------------------------
+                        h, w = frame.shape[:2]
+                        ball_center_xy = (float(w * 0.5), float(h * 0.5))
+                        ball_source = "init_center"
+                        bb = np.array(
+                            [
+                                float(w * 0.5 - 8),
+                                float(h * 0.5 - 8),
+                                float(w * 0.5 + 8),
+                                float(h * 0.5 + 8),
+                            ],
+                            dtype=np.float32,
+                        )
+                        synth = sv.Detections(
+                            xyxy=np.array([bb], dtype=np.float32),
+                            confidence=np.array([0.01], dtype=np.float32),
+                            class_id=np.array([0], dtype=np.int32),
+                            tracker_id=np.array([0], dtype=np.int32),
+                        )
+                        detections = self._append_synthetic_detection(detections, synth)
 
-                # 2b. Dataset export (same pass — before synthetic ball placeholder)
-                self._write_dataset_sample(frame, detections, frame_idx)
+                    if ball_center_xy is not None and ball_center_xy[0] is not None:
+                        bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
 
-                # 3. Ball center from merged ball row (BallTracker + interpolate); synthetic if missing
-                ball_mask = detections.class_id == 0
-                ball_center_xy = None
-                ball_source = "none"
-
-                if np.any(ball_mask):
-                    ball_idx = int(np.where(ball_mask)[0][0])
-                    b = detections.xyxy[ball_idx].astype(np.float32)
-                    ball_center_xy = (
-                        float((b[0] + b[2]) * 0.5),
-                        float((b[1] + b[3]) * 0.5),
-                    )
-                    ball_source = "ball_pipeline"
-                    try:
-                        detections.tracker_id[ball_idx] = 0
-                    except Exception:
-                        pass
-                else:
-                    h, w = frame.shape[:2]
-                    ball_center_xy = (float(w * 0.5), float(h * 0.5))
-                    ball_source = "init_center"
-                    bb = np.array(
-                        [
-                            float(w * 0.5 - 8),
-                            float(h * 0.5 - 8),
-                            float(w * 0.5 + 8),
-                            float(h * 0.5 + 8),
-                        ],
-                        dtype=np.float32,
-                    )
-                    synth = sv.Detections(
-                        xyxy=np.array([bb], dtype=np.float32),
-                        confidence=np.array([0.01], dtype=np.float32),
-                        class_id=np.array([0], dtype=np.int32),
-                        tracker_id=np.array([0], dtype=np.int32),
-                    )
-                    detections = self._append_synthetic_detection(detections, synth)
-
-                if ball_center_xy is not None and ball_center_xy[0] is not None:
-                    bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
-
-                # 3.6 Possession assignment (nearest player to ball)
-                player_mask = detections.class_id == 4
-                possessor_id = None
-                if ball_center_xy is not None and np.any(player_mask):
-                    possessor_id = self.possession.update(
-                        ball_center_xy=ball_center_xy,
-                        player_xyxy=detections.xyxy[player_mask],
-                        player_ids=detections.tracker_id[player_mask],
-                    )
-                else:
-                    possessor_id = self.possession.update(
-                        ball_center_xy=None,
-                        player_xyxy=None,
-                        player_ids=None,
-                    )
-
-                # 3.7 Basketball event detectors (optional plug-in)
-                if (
-                    self.pass_detector is not None
-                    and self.shot_detector is not None
-                    and self.make_miss_detector is not None
-                    and ball_center_xy is not None
-                    and ball_center_xy[0] is not None
-                ):
-                    bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
-                    if self._prev_ball_center_events is not None:
-                        px, py = self._prev_ball_center_events
-                        bvx, bvy = bx - px, by - py
+                    # 3.6 Possession assignment (nearest player to ball)
+                    player_mask = detections.class_id == 4
+                    possessor_id = None
+                    if ball_center_xy is not None and np.any(player_mask):
+                        possessor_id = self.possession.update(
+                            ball_center_xy=ball_center_xy,
+                            player_xyxy=detections.xyxy[player_mask],
+                            player_ids=detections.tracker_id[player_mask],
+                        )
                     else:
-                        bvx, bvy = 0.0, 0.0
-                    self._prev_ball_center_events = (bx, by)
-                    ball_state = BallState(position=(bx, by), velocity=(bvx, bvy))
+                        possessor_id = self.possession.update(
+                            ball_center_xy=None,
+                            player_xyxy=None,
+                            player_ids=None,
+                        )
 
-                    player_states: list[PlayerState] = []
+                    # 3.7 Basketball event detectors (optional plug-in)
+                    if (
+                        self.pass_detector is not None
+                        and self.shot_detector is not None
+                        and self.make_miss_detector is not None
+                        and ball_center_xy is not None
+                        and ball_center_xy[0] is not None
+                    ):
+                        bx, by = float(ball_center_xy[0]), float(ball_center_xy[1])
+                        if self._prev_ball_center_events is not None:
+                            px, py = self._prev_ball_center_events
+                            bvx, bvy = bx - px, by - py
+                        else:
+                            bvx, bvy = 0.0, 0.0
+                        self._prev_ball_center_events = (bx, by)
+                        ball_state = BallState(position=(bx, by), velocity=(bvx, bvy))
+
+                        player_states: list[PlayerState] = []
+                        if np.any(player_mask):
+                            for j in np.where(player_mask)[0]:
+                                bb = detections.xyxy[int(j)].astype(np.float32)
+                                cx = (float(bb[0]) + float(bb[2])) * 0.5
+                                cy = (float(bb[1]) + float(bb[3])) * 0.5
+                                pid = int(detections.tracker_id[int(j)])
+                                player_states.append(
+                                    PlayerState(player_id=pid, position=(cx, cy))
+                                )
+
+                        centers = [p.position for p in player_states]
+                        pids = [p.player_id for p in player_states]
+                        owner_for_events, _ = (
+                            assign_ball_owner((bx, by), centers, pids)
+                            if player_states
+                            else (None, None)
+                        )
+
+                        hoop_state = None
+                        hoop_mask = detections.class_id == 2
+                        if np.any(hoop_mask):
+                            hi = int(np.where(hoop_mask)[0][0])
+                            hbb = detections.xyxy[hi].astype(np.float32)
+                            hoop_state = Hoop(
+                                bbox=(
+                                    float(hbb[0]),
+                                    float(hbb[1]),
+                                    float(hbb[2]),
+                                    float(hbb[3]),
+                                )
+                            )
+
+                        pass_evt = self.pass_detector.detect(
+                            ball_state, player_states, owner_for_events
+                        )
+                        shot_evt = self.shot_detector.detect(ball_state, hoop_state)
+                        make_evt = self.make_miss_detector.detect(ball_state, hoop_state)
+
+                        payload = {
+                            "frame": frame_idx,
+                            "pass": bool(pass_evt),
+                            "shot": bool(shot_evt),
+                            "make": bool(make_evt),
+                        }
+
+                        if pass_evt and self.pass_detector.last_pass_from_id is not None:
+                            tid_pass = int(self.pass_detector.last_pass_from_id)
+                            self._bump_team_stat(
+                                self._team_label_for_player(tid_pass), "passes"
+                            )
+                        if shot_evt and owner_for_events is not None:
+                            self._bump_team_stat(
+                                self._team_label_for_player(int(owner_for_events)), "shots"
+                            )
+                        if make_evt and owner_for_events is not None:
+                            self._bump_team_stat(
+                                self._team_label_for_player(int(owner_for_events)), "makes"
+                            )
+
+                    if ball_center_xy is None or ball_source == "init_center":
+                        self._prev_ball_center_events = None
+
+                    # 4. Label preparation
+                    # Keep the video overlay clean: no per-track text labels in the final render.
+                    labels = None
+
+                    # 5. Visualization (ball/hoop via supervision; players drawn with team colors)
+                    annotated_frame = self.visualizer.draw_detections(
+                        frame=frame, detections=detections, labels=labels
+                    )
+
+                    # 5.1 Robust two-team classification (HSV KMeans + temporal majority) + foot ellipses (legacy style)
+                    player_mask = detections.class_id == 4
+                    possessor_id_int = (
+                        int(possessor_id) if possessor_id is not None else None
+                    )
+                    tcfg = self.team_classifier.cfg
+                    ellipse_cfg = TeamClusteringConfig(
+                        debug=False,
+                        draw_text=False,
+                        ellipse_color_team_a_bgr=tcfg.color_team_a_bgr,
+                        ellipse_color_team_b_bgr=tcfg.color_team_b_bgr,
+                        possession_highlight_bgr=tcfg.possession_highlight_bgr,
+                    )
                     if np.any(player_mask):
-                        for j in np.where(player_mask)[0]:
-                            bb = detections.xyxy[int(j)].astype(np.float32)
-                            cx = (float(bb[0]) + float(bb[2])) * 0.5
-                            cy = (float(bb[1]) + float(bb[3])) * 0.5
-                            pid = int(detections.tracker_id[int(j)])
-                            player_states.append(
-                                PlayerState(player_id=pid, position=(cx, cy))
-                            )
-
-                    centers = [p.position for p in player_states]
-                    pids = [p.player_id for p in player_states]
-                    owner_for_events, _ = (
-                        assign_ball_owner((bx, by), centers, pids)
-                        if player_states
-                        else (None, None)
-                    )
-
-                    hoop_state = None
-                    hoop_mask = detections.class_id == 2
-                    if np.any(hoop_mask):
-                        hi = int(np.where(hoop_mask)[0][0])
-                        hbb = detections.xyxy[hi].astype(np.float32)
-                        hoop_state = Hoop(
-                            bbox=(
-                                float(hbb[0]),
-                                float(hbb[1]),
-                                float(hbb[2]),
-                                float(hbb[3]),
-                            )
+                        player_xyxy = detections.xyxy[player_mask].astype(np.float32)
+                        player_ids = detections.tracker_id[player_mask].astype(int)
+                        confs = (
+                            detections.confidence[player_mask]
+                            if detections.confidence is not None
+                            else None
                         )
-
-                    pass_evt = self.pass_detector.detect(
-                        ball_state, player_states, owner_for_events
-                    )
-                    shot_evt = self.shot_detector.detect(ball_state, hoop_state)
-                    make_evt = self.make_miss_detector.detect(ball_state, hoop_state)
-
-                    payload = {
-                        "frame": frame_idx,
-                        "pass": bool(pass_evt),
-                        "shot": bool(shot_evt),
-                        "make": bool(make_evt),
-                    }
-
-                    if pass_evt and self.pass_detector.last_pass_from_id is not None:
-                        tid_pass = int(self.pass_detector.last_pass_from_id)
-                        self._bump_team_stat(
-                            self._team_label_for_player(tid_pass), "passes"
-                        )
-                    if shot_evt and owner_for_events is not None:
-                        self._bump_team_stat(
-                            self._team_label_for_player(int(owner_for_events)), "shots"
-                        )
-                    if make_evt and owner_for_events is not None:
-                        self._bump_team_stat(
-                            self._team_label_for_player(int(owner_for_events)), "makes"
-                        )
-
-                if ball_center_xy is None or ball_source == "init_center":
-                    self._prev_ball_center_events = None
-
-                # 4. Label preparation
-                # Keep the video overlay clean: no per-track text labels in the final render.
-                labels = None
-
-                # 5. Visualization (ball/hoop via supervision; players drawn with team colors)
-                annotated_frame = self.visualizer.draw_detections(
-                    frame=frame, detections=detections, labels=labels
-                )
-
-                # 5.1 Robust two-team classification (HSV KMeans + temporal majority) + foot ellipses (legacy style)
-                player_mask = detections.class_id == 4
-                possessor_id_int = (
-                    int(possessor_id) if possessor_id is not None else None
-                )
-                tcfg = self.team_classifier.cfg
-                ellipse_cfg = TeamClusteringConfig(
-                    debug=False,
-                    draw_text=False,
-                    ellipse_color_team_a_bgr=tcfg.color_team_a_bgr,
-                    ellipse_color_team_b_bgr=tcfg.color_team_b_bgr,
-                    possession_highlight_bgr=tcfg.possession_highlight_bgr,
-                )
-                if np.any(player_mask):
-                    player_xyxy = detections.xyxy[player_mask].astype(np.float32)
-                    player_ids = detections.tracker_id[player_mask].astype(int)
-                    confs = (
-                        detections.confidence[player_mask]
-                        if detections.confidence is not None
-                        else None
-                    )
-                    team_labels, _ = self.team_classifier.update_frame(
-                        annotated_frame,
-                        player_xyxy,
-                        player_ids,
-                        confidences=confs,
-                        time_sec=time_sec,
-                    )
-                    bboxes_xywh: list[list[float]] = []
-                    for bb in player_xyxy:
-                        x1, y1, x2, y2 = bb.tolist()
-                        bboxes_xywh.append(
-                            [x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)]
-                        )
-
-                    for bb_xywh, team_smoothed in zip(bboxes_xywh, team_labels):
-                        annotated_frame = draw_player_ellipse(
+                        team_labels, _ = self.team_classifier.update_frame(
                             annotated_frame,
-                            bb_xywh,
-                            team_smoothed,
-                            ellipse_cfg,
-                            player_id=None,
+                            player_xyxy,
+                            player_ids,
+                            confidences=confs,
+                            time_sec=time_sec,
                         )
+                        bboxes_xywh: list[list[float]] = []
+                        for bb in player_xyxy:
+                            x1, y1, x2, y2 = bb.tolist()
+                            bboxes_xywh.append(
+                                [x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)]
+                            )
 
-                self._last_possessor_id = possessor_id
+                        for bb_xywh, team_smoothed in zip(bboxes_xywh, team_labels):
+                            annotated_frame = draw_player_ellipse(
+                                annotated_frame,
+                                bb_xywh,
+                                team_smoothed,
+                                ellipse_cfg,
+                                player_id=None,
+                            )
 
-                self._draw_team_stats_panel(
-                    annotated_frame,
-                    self._team_stats["Team A"],
-                    self._team_stats["Team B"],
-                    tcfg.color_team_a_bgr,
-                    tcfg.color_team_b_bgr,
-                )
+                    self._last_possessor_id = possessor_id
 
-                # 6. Write frame
-                sink.write_frame(annotated_frame)
+                    self._draw_team_stats_panel(
+                        annotated_frame,
+                        self._team_stats["Team A"],
+                        self._team_stats["Team B"],
+                        tcfg.color_team_a_bgr,
+                        tcfg.color_team_b_bgr,
+                    )
+
+                    # 6. Write frame
+                    sink.write_frame(annotated_frame)
 
         # Majority lock for short clips + final labels for JSON export
         self.team_classifier.finalize_teams()
