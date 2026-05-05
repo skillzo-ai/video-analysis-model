@@ -573,8 +573,7 @@ class VideoProcessor:
                     if ball_center_xy is None or ball_source == "init_center":
                         self._prev_ball_center_events = None
 
-                    # 4. Label preparation
-                    # Keep the video overlay clean: no per-track text labels in the final render.
+                    # 4. Label preparation (ball/hoop only; player IDs drawn on team ellipses)
                     labels = None
 
                     # 5. Visualization (ball/hoop via supervision; players drawn with team colors)
@@ -590,7 +589,9 @@ class VideoProcessor:
                     tcfg = self.team_classifier.cfg
                     ellipse_cfg = TeamClusteringConfig(
                         debug=False,
-                        draw_text=False,
+                        draw_text=True,
+                        text_scale=0.55,
+                        text_thickness=2,
                         ellipse_color_team_a_bgr=tcfg.color_team_a_bgr,
                         ellipse_color_team_b_bgr=tcfg.color_team_b_bgr,
                         possession_highlight_bgr=tcfg.possession_highlight_bgr,
@@ -617,13 +618,15 @@ class VideoProcessor:
                                 [x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)]
                             )
 
-                        for bb_xywh, team_smoothed in zip(bboxes_xywh, team_labels):
+                        for bb_xywh, team_smoothed, pid in zip(
+                            bboxes_xywh, team_labels, player_ids
+                        ):
                             annotated_frame = draw_player_ellipse(
                                 annotated_frame,
                                 bb_xywh,
                                 team_smoothed,
                                 ellipse_cfg,
-                                player_id=None,
+                                player_id=int(pid),
                             )
 
                     self._last_possessor_id = possessor_id

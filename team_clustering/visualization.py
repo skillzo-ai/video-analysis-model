@@ -86,14 +86,41 @@ def draw_player_ellipse(
     if cfg.draw_bbox:
         cv2.rectangle(out, (x, y), (x + w, y + h), color, 2, cv2.LINE_AA)
 
-    if cfg.draw_text:
-        label = team_label if player_id is None else f"{team_label} #{player_id}"
-        tx = x
-        ty = max(0, y - 5)
+    if cfg.draw_text and player_id is not None:
+        # Centered above the player; text and outline use team color for readability on court.
+        label = f"ID {int(player_id)}"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = float(cfg.text_scale)
+        thickness = max(1, int(cfg.text_thickness))
+        (tw, th), bl = cv2.getTextSize(label, font, font_scale, thickness)
+        pad = 3
+        baseline_y = max(th + pad, y - pad)
+        tx_left = int(round(cx - tw * 0.5))
+        tx_left = max(0, min(tx_left, w_img - tw - 2 * pad))
+        bg_x1, bg_y1 = tx_left - pad, baseline_y - th - pad
+        bg_x2, bg_y2 = tx_left + tw + pad, baseline_y + bl + pad
+        bg_x1, bg_y1 = max(0, bg_x1), max(0, bg_y1)
+        bg_x2, bg_y2 = min(w_img - 1, bg_x2), min(h_img - 1, bg_y2)
+        cv2.rectangle(out, (bg_x1, bg_y1), (bg_x2, bg_y2), (0, 0, 0), -1)
+        cv2.rectangle(out, (bg_x1, bg_y1), (bg_x2, bg_y2), color, 1, cv2.LINE_AA)
         cv2.putText(
             out,
             label,
-            (tx, ty),
+            (tx_left, baseline_y),
+            font,
+            font_scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+    elif cfg.draw_text:
+        label = str(team_label)
+        tx = x
+        baseline_y = max(12, y - 4)
+        cv2.putText(
+            out,
+            label,
+            (tx, baseline_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             float(cfg.text_scale),
             color,
